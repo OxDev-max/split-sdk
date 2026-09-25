@@ -1225,6 +1225,23 @@ export type {
 } from "./cache/OptimisticCache.js";
 
 // ---------------------------------------------------------------------------
+// Split payment execution (pre-flight subentry guard + ratio validation)
+// ---------------------------------------------------------------------------
+
+export {
+  splitExecutor,
+  SPLIT_RATIO_TOLERANCE,
+  SplitRatioSumError,
+  sumRecipientRatios,
+  validateSplitRatioSum,
+} from "./payments/splitExecutor.js";
+export type {
+  SplitRecipient,
+  SplitExecutorOptions,
+  SplitExecutionResult,
+} from "./payments/splitExecutor.js";
+
+// ---------------------------------------------------------------------------
 // Typed, zero-dependency event emitter (works in Node, browser, and edge runtimes)
 // ---------------------------------------------------------------------------
 
