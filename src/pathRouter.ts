@@ -5,13 +5,15 @@
  * Horizon's path-payment endpoints to find the best conversion route and
  * returns the optimal path for each split leg.
  *
- * Integrates with {@link SimpleCache} to avoid redundant Horizon calls for
- * identical source/destination pairs within the cache TTL window.
+ * Delegates query assembly, validation, and caching to {@link PathQueryBuilder}
+ * to avoid redundant Horizon calls for identical source/destination pairs
+ * within the cache TTL window.
  */
 
 import { Asset, Horizon, Operation } from "@stellar/stellar-sdk";
-import { SimpleCache } from "./cache.js";
 import { PathNotFoundError, PathRouterError } from "./errors.js";
+import { PathQueryBuilder } from "./pathQueryBuilder.js";
+import { OrderBookSampler, type FillEstimate } from "./orderBookSampler.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -37,6 +39,15 @@ export interface PathResult {
   destinationAmount: bigint;
   /** Amount sent from the source (in the source asset's base unit). */
   sourceAmount: bigint;
+  /** Flag indicating if the path was found using the fallback threshold. */
+  usedFallback?: boolean;
+}
+
+export interface FindPathParams {
+  sourceAsset: Asset;
+  destinationAsset: Asset;
+  threshold: bigint;
+  fallbackSlippagePct?: number;
 }
 
 /** Parameters for pathfinding. */
@@ -49,12 +60,36 @@ export interface PathRequest {
   destinationAsset: Asset;
 }
 
+/** Payload emitted with a `highSlippageWarning` event. */
+export interface HighSlippageWarning {
+  /** The asset pair being traded. */
+  baseAsset: string;
+  counterAsset: string;
+  /** Computed slippage percentage. */
+  slippagePercent: number;
+  /** Configured tolerance that was exceeded. */
+  slippageTolerancePercent: number;
+  /** The full fill estimate that triggered the warning. */
+  fillEstimate: FillEstimate;
+}
+
 /** Configuration for {@link PathRouter}. */
 export interface PathRouterConfig {
   /** Cache TTL in milliseconds. Default: 15_000 (15s). */
   ttlMs?: number;
   /** Maximum number of cached paths. Default: 5_000. */
   maxEntries?: number;
+  /**
+   * Slippage tolerance percentage. When the order-book sampler reports a
+   * slippage above this value a `highSlippageWarning` callback is invoked.
+   * Default: 1 (%).
+   */
+  slippageTolerancePercent?: number;
+  /**
+   * Optional callback invoked when estimated slippage exceeds the tolerance.
+   * Wire this up to the application's event bus or logger as needed.
+   */
+  onHighSlippage?: (warning: HighSlippageWarning) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -67,10 +102,16 @@ export interface PathRouterConfig {
  *
  * Results are cached per (sourceAsset, destAsset, sourceAmount) triple to
  * avoid redundant Horizon queries within the TTL window.
+ *
+ * Since Issue #543: calls {@link OrderBookSampler.sample} before selecting a
+ * DEX path and fires `onHighSlippage` when slippage exceeds the tolerance.
  */
 export class PathRouter {
   private readonly server: Horizon.Server;
-  private readonly cache: SimpleCache<PathResult>;
+  private readonly queryBuilder: PathQueryBuilder;
+  private readonly slippageTolerancePercent: number;
+  private readonly onHighSlippage: ((warning: HighSlippageWarning) => void) | undefined;
+  private readonly sampler: OrderBookSampler;
 
   /**
    * @param horizonUrl - Horizon server URL.
@@ -78,10 +119,15 @@ export class PathRouter {
    */
   constructor(horizonUrl: string, config: PathRouterConfig = {}) {
     this.server = new Horizon.Server(horizonUrl);
-    this.cache = new SimpleCache<PathResult>({
-      enabled: true,
+    this.queryBuilder = new PathQueryBuilder(this.server, {
       ttlMs: config.ttlMs ?? 15_000,
       maxEntries: config.maxEntries ?? 5_000,
+    });
+    this.slippageTolerancePercent = config.slippageTolerancePercent ?? 1;
+    this.onHighSlippage = config.onHighSlippage;
+    this.sampler = new OrderBookSampler({
+      horizonUrl,
+      slippageTolerancePercent: this.slippageTolerancePercent,
     });
   }
 
@@ -95,53 +141,97 @@ export class PathRouter {
    *
    * Uses `strictSendPaths` under the hood — the source amount is fixed and
    * the destination amount is estimated.
+   *
+   * Before selecting the path, samples the order book for liquidity depth and
+   * emits a `highSlippageWarning` when slippage exceeds the configured tolerance.
    */
   async findStrictSendPath(req: PathRequest): Promise<PathResult> {
-    const cacheKey = this.cacheKey("send", req);
-    const cached = this.cache.get(cacheKey);
-    if (cached) return cached;
+    const sourceAssetType = assetType(req.sourceAsset);
+    const destAssetType = assetType(req.destinationAsset);
+
+    // Sample order book for slippage before path query
+    try {
+      const estimate = await this.sampler.sample(
+        req.sourceAsset,
+        req.destinationAsset,
+        "sell",
+        req.sourceAmount,
+      );
+      if (estimate.slippagePercent > this.slippageTolerancePercent && this.onHighSlippage) {
+        this.onHighSlippage({
+          baseAsset: sourceAssetType,
+          counterAsset: destAssetType,
+          slippagePercent: estimate.slippagePercent,
+          slippageTolerancePercent: this.slippageTolerancePercent,
+          fillEstimate: estimate,
+        });
+      }
+    } catch {
+      // Slippage check is best-effort; don't block path finding on sampler errors
+    }
 
     try {
-      const sourceAssetType = req.sourceAsset.isNative()
-        ? "native"
-        : `${req.sourceAsset.getCode()}:${req.sourceAsset.getIssuer()}`;
-      const destAssetType = req.destinationAsset.isNative()
-        ? "native"
-        : `${req.destinationAsset.getCode()}:${req.destinationAsset.getIssuer()}`;
+      const query = this.queryBuilder.forStrictSend({
+        sourceAsset: req.sourceAsset,
+        sourceAmount: req.sourceAmount,
+        destinationAssets: [req.destinationAsset],
+      });
+      const results = await this.queryBuilder.execute(query);
 
-      const records = await this.server
-        .strictSendPaths(
-          req.sourceAsset,
-          req.sourceAmount.toString(),
-          [req.destinationAsset],
-        )
-        .call();
-
-      if (records.records.length === 0) {
-        throw new PathNotFoundError(
-          sourceAssetType,
-          destAssetType,
-          req.sourceAmount,
-        );
+      if (results.length === 0) {
+        throw new PathNotFoundError(sourceAssetType, destAssetType, req.sourceAmount);
       }
 
-      // First record is the best path (highest destination amount)
-      const best = records.records[0]!;
-
-      const result: PathResult = {
-        path: best.path,
-        destinationAmount: BigInt(best.destination_amount),
-        sourceAmount: BigInt(best.source_amount),
-      };
-
-      this.cache.set(cacheKey, result);
-      return result;
+      // Results are sorted best-first (highest destination amount).
+      const best = results[0]!;
+      return { path: best.path, destinationAmount: best.destinationAmount, sourceAmount: best.sourceAmount };
     } catch (err) {
       if (err instanceof PathNotFoundError) throw err;
       throw new PathRouterError(
         `Failed to find strict-send path: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  /**
+   * Find a path using a primary threshold, with an optional fallback.
+   */
+  async findPath(params: FindPathParams): Promise<PathResult> {
+    const sourceAssetType = assetType(params.sourceAsset);
+    const destAssetType = assetType(params.destinationAsset);
+
+    const trySend = async (amount: bigint) => {
+      const query = this.queryBuilder.forStrictSend({
+        sourceAsset: params.sourceAsset,
+        sourceAmount: amount,
+        destinationAssets: [params.destinationAsset],
+      });
+      return await this.queryBuilder.execute(query);
+    };
+
+    let results = await trySend(params.threshold);
+    let usedFallback = false;
+
+    if (results.length === 0 && params.fallbackSlippagePct !== undefined) {
+      const pct = params.fallbackSlippagePct;
+      const multiplier = 1 + pct / 100;
+      const fallbackAmount = BigInt(Math.floor(Number(params.threshold) * multiplier));
+      
+      results = await trySend(fallbackAmount);
+      usedFallback = true;
+    }
+
+    if (results.length === 0) {
+      throw new PathNotFoundError(sourceAssetType, destAssetType, params.threshold);
+    }
+
+    const best = results[0]!;
+    return {
+      path: best.path,
+      destinationAmount: best.destinationAmount,
+      sourceAmount: best.sourceAmount,
+      ...(usedFallback ? { usedFallback: true } : {})
+    };
   }
 
   /**
@@ -156,51 +246,24 @@ export class PathRouter {
     destAmount: bigint,
     destinationAsset: Asset,
   ): Promise<PathResult> {
-    const cacheKey = this.cacheKeyReceive(sourceAsset, destAmount, destinationAsset);
-    const cached = this.cache.get(cacheKey);
-    if (cached) return cached;
+    const sourceAssetType = assetType(sourceAsset);
+    const destAssetType = assetType(destinationAsset);
 
     try {
-      const sourceAssetType = sourceAsset.isNative()
-        ? "native"
-        : `${sourceAsset.getCode()}:${sourceAsset.getIssuer()}`;
-      const destAssetType = destinationAsset.isNative()
-        ? "native"
-        : `${destinationAsset.getCode()}:${destinationAsset.getIssuer()}`;
+      const query = this.queryBuilder.forStrictReceive({
+        sourceAssets: [sourceAsset],
+        destinationAsset,
+        destinationAmount: destAmount,
+      });
+      const results = await this.queryBuilder.execute(query);
 
-      const srcStr = sourceAsset.isNative()
-        ? "native"
-        : `${sourceAsset.getCode()}:${sourceAsset.getIssuer()}`;
-      const dstStr = destinationAsset.isNative()
-        ? "native"
-        : `${destinationAsset.getCode()}:${destinationAsset.getIssuer()}`;
-
-      const records = await this.server
-        .strictReceivePaths(
-          srcStr,
-          destinationAsset,
-          destAmount.toString(),
-        )
-        .call();
-
-      if (records.records.length === 0) {
-        throw new PathNotFoundError(
-          sourceAssetType,
-          destAssetType,
-          destAmount,
-        );
+      if (results.length === 0) {
+        throw new PathNotFoundError(sourceAssetType, destAssetType, destAmount);
       }
 
-      const best = records.records[0]!;
-
-      const result: PathResult = {
-        path: best.path,
-        destinationAmount: BigInt(best.destination_amount),
-        sourceAmount: BigInt(best.source_amount),
-      };
-
-      this.cache.set(cacheKey, result);
-      return result;
+      // Results are sorted best-first (lowest source amount).
+      const best = results[0]!;
+      return { path: best.path, destinationAmount: best.destinationAmount, sourceAmount: best.sourceAmount };
     } catch (err) {
       if (err instanceof PathNotFoundError) throw err;
       throw new PathRouterError(
@@ -259,37 +322,20 @@ export class PathRouter {
   }
 
   /**
+   * Expose the underlying {@link OrderBookSampler} for direct depth queries.
+   */
+  getOrderBookSampler(): OrderBookSampler {
+    return this.sampler;
+  }
+
+  /**
    * Clear all cached paths.
    */
   clearCache(): void {
-    this.cache.clear();
+    this.queryBuilder.clearCache();
   }
+}
 
-  // -------------------------------------------------------------------------
-  // Internal helpers
-  // -------------------------------------------------------------------------
-
-  private cacheKey(kind: "send" | "receive", req: PathRequest): string {
-    const src = req.sourceAsset.isNative()
-      ? "native"
-      : `${req.sourceAsset.getCode()}:${req.sourceAsset.getIssuer()}`;
-    const dst = req.destinationAsset.isNative()
-      ? "native"
-      : `${req.destinationAsset.getCode()}:${req.destinationAsset.getIssuer()}`;
-    return `path:${kind}:${src}:${dst}:${req.sourceAmount.toString()}`;
-  }
-
-  private cacheKeyReceive(
-    sourceAsset: Asset,
-    destAmount: bigint,
-    destinationAsset: Asset,
-  ): string {
-    const src = sourceAsset.isNative()
-      ? "native"
-      : `${sourceAsset.getCode()}:${sourceAsset.getIssuer()}`;
-    const dst = destinationAsset.isNative()
-      ? "native"
-      : `${destinationAsset.getCode()}:${destinationAsset.getIssuer()}`;
-    return `path:receive:${src}:${dst}:${destAmount.toString()}`;
-  }
+function assetType(asset: Asset): string {
+  return asset.isNative() ? "native" : `${asset.getCode()}:${asset.getIssuer()}`;
 }

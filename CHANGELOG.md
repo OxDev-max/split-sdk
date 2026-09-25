@@ -11,6 +11,40 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 
+- **Add pluggable signing key vault adapter (closes #589)**
+  - `Signer` interface (`sign(txHash: Buffer): Promise<Buffer>`) decouples signing from key storage — inject an HSM, cloud KMS, or encrypted keystore without SDK changes
+  - `KeypairSigner` wraps an in-memory stellar-sdk `Keypair`; produces 64-byte ed25519 signatures verifiable via `Keypair.verify`
+  - `EncryptedFileSigner` reads an AES-256-GCM encrypted PEM key file, decrypts on first use, and holds the keypair in a `WeakRef` — GC pressure (or `clearCache()`) triggers a transparent re-read on the next sign
+  - `CloudKmsSigner` delegates to any injected `KmsClient { sign(keyId, digest) }`, keeping vendor SDKs out of the package and enabling trivial test mocking
+  - `StellarSplitClient` accepts `signer: Signer` at construction (exposed via `client.signer`)
+  - Full docs in `docs/SIGNING_VAULT.md`
+- **Add Soroban transaction footprint optimizer (closes #588)**
+  - `optimizeFootprint(tx, sim)` rebuilds a transaction with the minimal read/write key set from `simulateTransaction`, pruning stale/over-broad keys that inflate inclusion fees
+  - `footprintDiff` public utility classifies `{ added, removed, unchanged }` ledger keys by canonical XDR encoding
+  - Each pruned key is logged at `debug` level via the SDK logger
+  - `submitTransaction(server, tx, sim, opts?)` runs the optimizer by default; pass `{ optimizeFootprint: false }` to opt out
+  - Already-minimal footprints pass through byte-identical; the input transaction is never mutated
+  - Full docs in `docs/FOOTPRINT_OPTIMIZER.md`
+- **Add invoice due-date reminder scheduler (closes #542)**
+  - `InvoiceReminderScheduler.schedule(invoiceId, offsets: number[])` registers reminders at each offset (ms) before an invoice's due date
+  - Schedules persist via `saveReminderSchedules`/`loadReminderSchedules` (`src/snapshot.ts`), keyed by invoice, so reminders survive process restarts
+  - On construction, past-due reminders within `gracePeriodMs` (default 60 000 ms) fire automatically; older ones are marked `expired`
+  - Emits `invoiceReminderDue` with `{ invoiceId, offsetMs, dueAt }` via the existing `TypedEventEmitter`
+  - `InvoiceReminderScheduler.cancel(invoiceId)` removes all pending reminders for an invoice
+  - New types: `ReminderSchedule`, `ReminderEvent`, `ReminderStatus`; `InvoiceRecord.dueAt` added
+- **Add auth-required trustline request handler (closes #541)**
+  - `TrustlineAuthHandler.checkAndRequest(recipientId, asset)` detects `AUTH_REQUIRED` issuers and emits `trustlineAuthRequired` with the issuer's public key
+  - `TrustlineAuthHandler.grantAuth(recipientId, asset, issuerKeypair)` builds, signs, and submits the approval operation
+  - Prefers `SetTrustLineFlags` (protocol >= 18) and falls back to legacy `AllowTrust` on older networks, detected via new `src/sorobanFeatureDetector.ts`
+  - Issuer account flags read via new `src/accountFlagsInspector.ts`; integrated into `src/preflightChecker.ts` as `checkTrustlineAuthRequirement`
+  - Emits `trustlineAuthGranted` after successful submission
+- **Add SEP-31 cross-border payment initiator (closes #540)**
+  - `Sep31Initiator.initiate(...)` completes the anchor `/send` call and stores the returned transaction record
+  - `Sep31Initiator.getRequiredFields(anchorDomain, asset)` reads the anchor `/info` endpoint and returns a typed field schema
+  - `Sep31Initiator.pollStatus(transactionId, anchorDomain)` is an async generator yielding status updates until a terminal state (`completed`/`error`)
+  - Resolves the receiving anchor's `DIRECT_PAYMENT_SERVER` from its stellar.toml via `StellarToml.Resolver`
+  - SEP-10 JWT passed to `initiate()` is reused automatically for subsequent `pollStatus` calls
+  - New types: `Sep31PaymentRecord`, `Sep31Status`, `Sep31StatusChangedEvent`, `Sep31RequiredFields`, `Sep31FieldSpec`
 - **Build invoice diff utility — compare two invoice states (closes #363)**
   - `diffInvoices(a: Invoice, b: Invoice)` returns structured diff of two invoice objects
   - Returns `InvoiceDiff` as `{ field: string, before: unknown, after: unknown }[]` — only changed fields listed

@@ -14,6 +14,7 @@ import { TelemetryCollector } from "../src/telemetryCollector.js";
 import { DIContainer } from "../src/container.js";
 import { StellarSplitClient } from "../src/client.js";
 import { WalletConnectAdapter } from "../src/adapters/walletconnect.js";
+import { KeypairSigner } from "../src/signing/adapters/KeypairSigner.js";
 import { buildSchema } from "graphql";
 import { generateGraphQLSchema } from "../src/graphql.js";
 
@@ -846,7 +847,12 @@ describe("cloneInvoice", () => {
       clear: vi.fn(),
     };
 
-    const result = await client.cloneInvoice("123", { newDeadline: 1_800_000_000 });
+    // The fixture invoice (2023 deadline, unfunded recipient) is not cloneable;
+    // these tests exercise the submission path, so validation is skipped.
+    const result = await client.cloneInvoice("123", {
+      newDeadline: 1_800_000_000,
+      skipValidation: true,
+    });
 
     expect(result).toBe("456");
     expect(submitSpy).toHaveBeenCalledTimes(1);
@@ -886,7 +892,9 @@ describe("cloneInvoice", () => {
     };
     (client as any)._cache = cache;
 
-    await expect(client.cloneInvoice("123")).rejects.toThrow("network error");
+    await expect(
+      client.cloneInvoice("123", { skipValidation: true }),
+    ).rejects.toThrow("network error");
     expect(cache.set).not.toHaveBeenCalled();
     expect(cache.invalidate).not.toHaveBeenCalled();
   });
@@ -1319,6 +1327,31 @@ describe("getCrossChainRef / setCrossChainRef", () => {
     });
 
     expect(submitSpy).toHaveBeenCalledWith(creator, expect.anything());
+  });
+});
+
+describe("signer option (issue #589)", () => {
+  it("accepts a pluggable Signer and exposes it via client.signer", () => {
+    const keypair = Keypair.random();
+    const signer = new KeypairSigner(keypair);
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+      signer,
+    });
+
+    expect(client.signer).toBe(signer);
+  });
+
+  it("returns null from client.signer when no signer is configured", () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    expect(client.signer).toBeNull();
   });
 });
 

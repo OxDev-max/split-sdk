@@ -11,7 +11,7 @@
  * actionable error objects.
  */
 
-import { ValidationError } from "../errors.js";
+import { ValidationError, SdkError, SdkErrorCode } from "../errors.js";
 import type { Recipient } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -44,6 +44,15 @@ export interface SplitConfig {
    * dealing with imprecise user input).
    */
   tolerance?: number;
+  /**
+   * Minimum share ratio per recipient, expressed as a percentage (e.g. 0.01
+   * means 0.01 %). Any recipient whose ratio falls below this threshold
+   * fails validation because the resulting dust payment would be rejected
+   * by Stellar's minimum balance check.
+   *
+   * Defaults to `0.01` (0.01 %). Set to `0` to disable the minimum check.
+   */
+  minRatioPercent?: number;
 }
 
 /** Structured validation result returned by {@link validateSplitRatios}. */
@@ -66,8 +75,9 @@ export interface SplitRatioValidationResult {
  * 1. At least one share is provided.
  * 2. No share is negative.
  * 3. No share is zero.
- * 4. No duplicate recipient addresses.
- * 5. Shares sum to 1.0 (± tolerance).
+ * 4. No recipient ratio is below `minRatioPercent` (default 0.01 %).
+ * 5. No duplicate recipient addresses.
+ * 6. Shares sum to 1.0 (± tolerance).
  *
  * @param config - The split configuration to validate.
  * @returns A structured result with `valid` and `errors` fields.
@@ -100,7 +110,20 @@ export function validateSplitRatios(
     }
   }
 
-  // 3. Duplicate address check
+  // 3. Minimum ratio check
+  const minRatioPercent = config.minRatioPercent ?? 0.01;
+  if (minRatioPercent > 0) {
+    const minShareFraction = minRatioPercent / 100;
+    for (const share of config.shares) {
+      if (share.share > 0 && share.share < minShareFraction) {
+        errors.push(
+          `Recipient ${share.address} has a ratio of ${(share.share * 100).toPrecision(4)}% which is below the minimum ${minRatioPercent}%. Increase the recipient's share or set minRatioPercent to 0 to disable this check.`,
+        );
+      }
+    }
+  }
+
+  // 4. Duplicate address check
   const seen = new Set<string>();
   for (const share of config.shares) {
     if (seen.has(share.address)) {
@@ -177,4 +200,74 @@ export function ratiosToRecipients(
     address: s.address,
     amount: amounts[i]!,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Precise bigint-based total validation
+// ---------------------------------------------------------------------------
+
+/** Default total, expressed in basis points (10000 = 100.00%). */
+const DEFAULT_TOTAL_BASIS_POINTS = 10_000n;
+
+/**
+ * Validate that an array of bigint split values sums to exactly
+ * `totalBasisPoints` (defaults to 10000n, i.e. 100.00%).
+ *
+ * Uses only bigint arithmetic so floating-point rounding (e.g.
+ * 0.1 + 0.2 !== 0.3) can never mask an invalid split.
+ *
+ * @param splits - Recipient split values in basis points.
+ * @param totalBasisPoints - Expected sum. Defaults to 10000n.
+ * @throws SdkError with code {@link SdkErrorCode.INVALID_RECIPIENT} when the
+ *   splits array is empty or the sum does not equal `totalBasisPoints`.
+ */
+export function validateSplitTotal(
+  splits: bigint[],
+  totalBasisPoints: bigint = DEFAULT_TOTAL_BASIS_POINTS,
+): void {
+  if (splits.length === 0) {
+    throw new SdkError(
+      "splits must sum to 10000 basis points",
+      SdkErrorCode.INVALID_RECIPIENT,
+      { splits, totalBasisPoints },
+    );
+  }
+
+  let sum = 0n;
+  for (const split of splits) {
+    sum += split;
+  }
+
+  if (sum !== totalBasisPoints) {
+    throw new SdkError(
+      "splits must sum to 10000 basis points",
+      SdkErrorCode.INVALID_RECIPIENT,
+      { splits, sum, totalBasisPoints },
+    );
+  }
+}
+
+/**
+ * Normalize an array of bigint amounts so they sum to exactly `total`,
+ * distributing any rounding remainder to the last recipient.
+ *
+ * @param amounts - Recipient amounts (e.g. produced by a proportional split).
+ * @param total - The exact total the amounts must sum to.
+ * @returns A new array of the same length whose values sum to `total`.
+ */
+export function normalizeSplits(amounts: bigint[], total: bigint): bigint[] {
+  if (amounts.length === 0) {
+    return [];
+  }
+
+  const normalized = amounts.slice();
+  let sum = 0n;
+  for (const amount of normalized) {
+    sum += amount;
+  }
+
+  const remainder = total - sum;
+  normalized[normalized.length - 1] = normalized[normalized.length - 1]! + remainder;
+
+  return normalized;
 }
