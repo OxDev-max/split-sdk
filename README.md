@@ -150,6 +150,28 @@ new StellarSplitClient(config: StellarSplitClientConfig)
 | Function | Returns | Description |
 |----------|---------|-------------|
 | `enrichInvoice(invoiceId)` | `Promise<EnrichedInvoice>` | Fetch IPFS metadata from invoice memo CID and merge it into the invoice |
+| `pinInvoiceMetadata(metadata)` | `Promise<string>` | Pin invoice metadata to IPFS, returning its CID |
+| `verifyCID(cid, content)` | `Promise<boolean>` | Recompute the CID from `content` and check it matches |
+| `verifyCIDDetailed(cid, content)` | `Promise<CIDVerificationResult>` | As above, returning the computed CID and an error message |
+
+### IPFS Metadata & CID Verification
+
+A CID is a self-describing content address, so `verifyCID` **recomputes** it
+from the bytes and compares — it does not merely check that a fetch round-tripped.
+
+```ts
+const cid = await pinInvoiceMetadata(metadata);
+await verifyCIDOrThrow(cid, metadata); // throws CIDMismatchError on tampering
+```
+
+Both CIDv0 (`Qm…`) and CIDv1 (`bafy…`) are supported, and verification always
+recomputes in the same version as the CID being checked. `ipfs://` URIs are
+accepted. When you supply the content, verification is entirely local — no
+network round-trip — and genuinely proves the bytes hash to the claimed
+address; a fabricated CID will not verify.
+
+`verifyCIDOrThrow` reports the CID the content *actually* produced, so a
+mismatch tells you whether the address or the bytes are wrong.
 
 ### Pluggable Signing Key Vault Adapter
 
