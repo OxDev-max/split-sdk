@@ -145,6 +145,34 @@ new StellarSplitClient(config: StellarSplitClientConfig)
 | `generateWebhookSignature(payload, secret)` | `Promise<string>` | Generate HMAC-SHA256 signature for a webhook payload |
 | `verifyWebhookSignature(payload, signature, secret)` | `Promise<boolean>` | Manually verify a webhook signature without middleware |
 
+The middleware also exposes a typed event emitter, so you can subscribe per
+event type instead of branching on `req.webhookPayload.event` in a downstream
+Express handler. Only deliveries that pass signature, timestamp and nonce
+validation are emitted, so handlers can trust what they receive:
+
+```ts
+const middleware = createWebhookMiddleware(secret, {
+  toleranceSeconds: 300,   // reject timestamps outside a 5-minute window
+  nonceWindowSize: 1000,   // in-memory LRU size for replay protection
+});
+
+// `data` is typed per event — no cast needed
+middleware.emitter.on("invoice.paid", ({ data, request }) => {
+  console.log(data.invoiceId, data.amount);
+});
+
+middleware.emitter.on("invoice.expired", ({ data }) => {
+  console.log("expired:", data.invoiceId);
+});
+
+// Wildcard: fires for every event type
+const unsubscribe = middleware.emitter.on("*", ({ event }) => log(event));
+
+app.post("/webhooks/stellarsplit", express.raw({ type: "application/json" }), middleware, (req, res) => {
+  res.status(200).json({ received: true });
+});
+```
+
 ### Invoice Metadata Enricher
 
 | Function | Returns | Description |
