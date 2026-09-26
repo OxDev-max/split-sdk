@@ -39,6 +39,7 @@
     "dev": "tsup --watch",
     "test": "vitest run test/client.test.ts test/retryPolicy.test.ts",
     "test:ui": "vitest run test/ui/",
+    "test:integration": "vitest run tests/integration",
     "test:all": "vitest run",
     "test:e2e": "vitest run test/e2e",
     "test:watch": "vitest",
