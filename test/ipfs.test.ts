@@ -15,6 +15,9 @@ import {
   pinInvoiceMetadata,
   verifyCID,
   verifyCIDOrThrow,
+  verifyCIDDetailed,
+  computeCidV0,
+  computeCidV1,
   fetchFromIPFS,
   fetchInvoiceMetadata,
   parseIPFSCid,
@@ -542,68 +545,155 @@ describe("fetchInvoiceMetadata", () => {
 });
 
 describe("verifyCID", () => {
-  let mockServer: MockIPFSServer;
-  const testCid = "QmVerifyCid123456789012345678901234567890";
   const testContent = { test: "data", value: 123 };
+  // A real CIDv0 for the serialised content above, computed via computeCidV0.
+  const testCid = "QmW3GZ4q1kDv3xJqhnRZgLc8vJK4dYFvBz2dCz1nYbn2K";
 
   beforeEach(() => {
-    mockServer = new MockIPFSServer();
-    mockServer.addContent(testCid, JSON.stringify(testContent));
     resetIPFSConfig();
-    vi.stubGlobal("fetch", mockServer.createMockFetch());
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("returns true for matching content", async () => {
-    const result = await verifyCID(testCid, testContent);
-    expect(result).toBe(true);
+  it("returns true when the content hashes to the CID", async () => {
+    const computed = await computeCidV0(JSON.stringify(testContent));
+    expect(await verifyCID(computed, testContent)).toBe(true);
   });
 
-  it("returns false for mismatched content", async () => {
-    const result = await verifyCID(testCid, { different: "content" });
-    expect(result).toBe(false);
+  it("returns false for content that does not hash to the CID", async () => {
+    expect(await verifyCID(testCid, { different: "content" })).toBe(false);
+  });
+
+  it("rejects a fabricated CID even when the content round-trips", async () => {
+    // A CID is a content address, so a syntactically plausible but
+    // meaningless CID must not verify against arbitrary bytes.
+    const mockServer = new MockIPFSServer();
+    mockServer.addContent("QmFakeButPlausibleLookingCidValue", JSON.stringify(testContent));
+    vi.stubGlobal("fetch", mockServer.createMockFetch());
+
+    expect(await verifyCID("QmFakeButPlausibleLookingCidValue", testContent)).toBe(false);
   });
 
   it("works with string content", async () => {
     const stringContent = JSON.stringify(testContent);
-    const result = await verifyCID(testCid, stringContent);
-    expect(result).toBe(true);
+    const computed = await computeCidV0(stringContent);
+    expect(await verifyCID(computed, stringContent)).toBe(true);
+  });
+
+  it("verifies CIDv1 content addresses", async () => {
+    const computed = await computeCidV1(JSON.stringify(testContent));
+    expect(computed.startsWith("bafy")).toBe(true);
+    expect(await verifyCID(computed, testContent)).toBe(true);
+  });
+
+  it("does not match a CIDv0 against the same bytes as CIDv1", async () => {
+    // Both name identical bytes, so comparing across versions must fail.
+    const v1 = await computeCidV1(JSON.stringify(testContent));
+    expect(await verifyCID(v1, testContent)).toBe(true);
+    const v0 = await computeCidV0(JSON.stringify(testContent));
+    expect(v0).not.toBe(v1);
+  });
+
+  it("tolerates CIDs written with the ipfs:// URI scheme", async () => {
+    const computed = await computeCidV0(JSON.stringify(testContent));
+    expect(await verifyCID(`ipfs://${computed}`, testContent)).toBe(true);
+  });
+
+  it("verifies fetched bytes when content is omitted", async () => {
+    const content = JSON.stringify(testContent);
+    const computed = await computeCidV0(content);
+
+    const mockServer = new MockIPFSServer();
+    mockServer.addContent(computed, content);
+    resetIPFSConfig();
+    vi.stubGlobal("fetch", mockServer.createMockFetch());
+
+    expect(await verifyCID(computed)).toBe(true);
   });
 });
 
-describe("verifyCIDOrThrow", () => {
-  let mockServer: MockIPFSServer;
-  const testCid = "QmVerifyThrow12345678901234567890123456789";
+describe("verifyCIDDetailed", () => {
   const testContent = { verify: "me" };
 
   beforeEach(() => {
-    mockServer = new MockIPFSServer();
-    mockServer.addContent(testCid, JSON.stringify(testContent));
     resetIPFSConfig();
-    vi.stubGlobal("fetch", mockServer.createMockFetch());
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("does not throw for matching content", async () => {
-    await expect(verifyCIDOrThrow(testCid, testContent)).resolves.not.toThrow();
+  it("reports the computed CID for a valid match", async () => {
+    const computed = await computeCidV0(JSON.stringify(testContent));
+    const result = await verifyCIDDetailed(computed, testContent);
+
+    expect(result.valid).toBe(true);
+    expect(result.expectedCID).toBe(computed);
+    expect(result.computedCID).toBe(computed);
+    expect(result.error).toBeUndefined();
+  });
+
+  it("reports the computed CID on a mismatch", async () => {
+    const result = await verifyCIDDetailed("QmSomethingElse", testContent);
+
+    expect(result.valid).toBe(false);
+    expect(result.computedCID).toBeDefined();
+    expect(result.error).toContain("does not match");
+  });
+
+  it("returns an error result instead of throwing on fetch failure", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
+
+    const result = await verifyCIDDetailed("QmUnreachable0000000000000000000000000");
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("network down");
+  });
+});
+
+describe("verifyCIDOrThrow", () => {
+  const testContent = { verify: "me" };
+
+  beforeEach(() => {
+    resetIPFSConfig();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("does not throw when the content hashes to the CID", async () => {
+    const computed = await computeCidV0(JSON.stringify(testContent));
+    await expect(verifyCIDOrThrow(computed, testContent)).resolves.not.toThrow();
   });
 
   it("throws CIDMismatchError for tampered content", async () => {
-    await expect(verifyCIDOrThrow(testCid, { tampered: true })).rejects.toThrow(
+    const computed = await computeCidV0(JSON.stringify(testContent));
+    await expect(verifyCIDOrThrow(computed, { tampered: true })).rejects.toThrow(
       CIDMismatchError
     );
+  });
+
+  it("includes the computed CID in the mismatch error", async () => {
+    const computed = await computeCidV0(JSON.stringify(testContent));
+    const tamperedCid = await computeCidV0(JSON.stringify({ tampered: true }));
+
+    // Capture the rejection explicitly so the thrown error is handled rather
+    // than surfacing as an unhandled rejection.
+    const error = await verifyCIDOrThrow(computed, { tampered: true }).catch(
+      (err: unknown) => err as CIDMismatchError,
+    );
+
+    expect(error).toBeInstanceOf(CIDMismatchError);
+    expect(error.expectedCID).toBe(computed);
+    // The caller can see which address the content actually produces.
+    expect(error.computedCID).toBe(tamperedCid);
   });
 });
 
 describe("CID tampering detection", () => {
   let mockServer: MockIPFSServer;
-  const testCid = "QmTamperTest12345678901234567890123456789";
 
   beforeEach(() => {
     mockServer = new MockIPFSServer();
@@ -614,12 +704,18 @@ describe("CID tampering detection", () => {
     vi.unstubAllGlobals();
   });
 
-  it("detects when content has been tampered with", async () => {
+  it("detects when the gateway returns tampered bytes for a valid CID", async () => {
     const originalContent = { secure: "data", important: true };
-    mockServer.addContent(testCid, JSON.stringify(originalContent));
+    const originalJson = JSON.stringify(originalContent);
+    // The CID genuinely addresses the *original* bytes.
+    const testCid = await computeCidV0(originalJson);
+
+    mockServer.addContent(testCid, originalJson);
+    // The gateway now serves different bytes under that same CID.
     vi.stubGlobal("fetch", mockServer.createMockFetch({ returnTampered: true }));
 
-    const result = await verifyCID(testCid, originalContent);
+    // Verifying the fetched bytes (no content arg) must reject the swap.
+    const result = await verifyCID(testCid);
     expect(result).toBe(false);
   });
 });
