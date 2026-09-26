@@ -93,6 +93,8 @@ app.post(
 
 ## API Reference
 
+The full auto-generated API reference documentation is available here: [API Documentation](https://stellar-split.github.io/split-sdk/)
+
 ### `StellarSplitClient`
 
 #### Constructor
