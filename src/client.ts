@@ -654,6 +654,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    */
   private _effectiveRpcPoolSize = 0;
   private _batcher: BatchedRpcClient | null = null;
+
+  /**
+   * Live client instances, so {@link ProfilerSession} can instrument each
+   * client's RPC server.
+   *
+   * Held on the class rather than patched per-instance because the profiler
+   * wraps the prototype once but every client owns its own `server` object.
+   *
+   * @internal
+   */
+  static readonly _instances = new Set<StellarSplitClient>();
   private _telemetryHookManager = new TelemetryHookManager();
   private _timeoutManager: TimeoutManager | null = null;
   private _traceIdManager = new TraceIdManager();
@@ -830,6 +841,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @throws {Error} If the method fails.
    */
     super();
+
+    // Register so ProfilerSession can wrap this client's RPC server.
+    StellarSplitClient._instances.add(this);
   /**
    * validateOrThrow
    * @param params - The parameters for the method.
