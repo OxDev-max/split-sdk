@@ -1427,3 +1427,40 @@ export type {
   SubmitTransactionOptions,
   SubmitServer,
 } from "./transaction/submit.js";
+
+// ---------------------------------------------------------------------------
+// Issues #878 / #879 / #880 / #881 — Extended error taxonomy & new features
+// ---------------------------------------------------------------------------
+
+export {
+  RoundNotEndedError,
+  isRoundNotEndedError,
+  WrongMilestoneError,
+  isWrongMilestoneError,
+  NothingToClaimError,
+  isNothingToClaimError,
+  InvoiceExpiredError,
+  isInvoiceExpiredError,
+  PayerNotWhitelistedError,
+  isPayerNotWhitelistedError,
+  ContributionCapExceededError,
+  isContributionCapExceededError,
+  PaymentCooldownActiveError,
+  isPaymentCooldownActiveError,
+  ContractFrozenError,
+  isContractFrozenError,
+  InvoiceFullyFundedError,
+  isInvoiceFullyFundedError,
+  isRetryable,
+} from "./errors.js";
+
+export type {
+  PayerRefund,
+  RoundCloseResult,
+  RoundInfo,
+  MilestoneStatus,
+  Milestone,
+  MilestoneResult,
+  ReferralClaimResult,
+  ReferralPayResult,
+} from "./types.js";

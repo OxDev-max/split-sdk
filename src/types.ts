@@ -2150,3 +2150,98 @@ export interface ClaimableBalanceRecord {
   /** Ledger sequence after which the predicate expires (optional). */
   predicateExpiryLedger?: number;
 }
+
+// ---------------------------------------------------------------------------
+// Issues #878 — Round types
+// ---------------------------------------------------------------------------
+
+/** A single payer's refund breakdown after a round is closed. */
+export interface PayerRefund {
+  /** Stellar address of the payer. */
+  payer: string;
+  /** Amount (in stroops) that was kept / credited toward the invoice. */
+  amountKept: bigint;
+  /** Amount (in stroops) refunded to this payer due to over-subscription. */
+  amountRefunded: bigint;
+}
+
+/** Result returned by closeRound. */
+export interface RoundCloseResult {
+  /** Total amount raised (in stroops) before overflow trimming. */
+  totalRaised: bigint;
+  /** Maximum amount the round was capped at (in stroops). */
+  hardCap: bigint;
+  /** Overflow amount distributed back as refunds (in stroops). */
+  overflow: bigint;
+  /** Per-payer refund breakdown. */
+  refunds: PayerRefund[];
+  /** Transaction hash of the close_round call. */
+  txHash: string;
+}
+
+/** Current state of a fundraising round. */
+export interface RoundInfo {
+  /** Invoice identifier. */
+  invoiceId: string;
+  /** Total raised so far (in stroops). */
+  totalRaised: bigint;
+  /** Round hard cap (in stroops). */
+  hardCap: bigint;
+  /** Unix timestamp when the round ends. */
+  roundEnd: number;
+  /** Whether the round has ended and been closed. */
+  closed: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Issues #879 — Milestone types
+// ---------------------------------------------------------------------------
+
+/** Status of a milestone. */
+export type MilestoneStatus = 'locked' | 'active' | 'completed';
+
+/** A single milestone in an invoice's milestone schedule. */
+export interface Milestone {
+  /** Zero-based milestone index. */
+  index: number;
+  /** Human-readable description of what this milestone represents. */
+  description: string;
+  /** Target amount required to complete this milestone (in stroops). */
+  targetAmount: bigint;
+  /** Amount currently funded toward this milestone (in stroops). */
+  fundedAmount: bigint;
+  /** Current lifecycle status of this milestone. */
+  status: MilestoneStatus;
+}
+
+/** Result returned by completeMilestone. */
+export interface MilestoneResult {
+  /** Index of the milestone that was completed. */
+  index: number;
+  /** Amount released to recipients upon completion (in stroops). */
+  amountReleased: bigint;
+  /** Index of the next milestone, if any. */
+  nextMilestoneIndex?: number;
+  /** Transaction hash. */
+  txHash: string;
+}
+
+// ---------------------------------------------------------------------------
+// Issues #880 — Referral types
+// ---------------------------------------------------------------------------
+
+/** Result returned by claimReferralRewards. */
+export interface ReferralClaimResult {
+  /** Amount of referral rewards claimed (in stroops). */
+  amountClaimed: bigint;
+  /** Transaction hash. */
+  txHash: string;
+}
+
+/** Result returned by payWithReferral. */
+export interface ReferralPayResult {
+  /** Transaction hash. */
+  txHash: string;
+  /** Referrer address credited for this payment. */
+  referrer: string;
+}

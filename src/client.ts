@@ -78,6 +78,7 @@ import {
 } from "./compression.js";
 import type { CompressionConfig } from "./compression.js";
 import { calculateFee } from "./fee.js";
+import { isValidStellarAddress as isValidAddress } from "./utils.js";
 import { resolveToken } from "./token.js";
 import { generatePaymentReceipt } from "./receipt.js";
 import type { PaymentReceipt } from "./receipt.js";
@@ -156,6 +157,14 @@ import type {
   BridgePaymentParams,
   BridgePaymentRequest,
   SignedBridgeProof,
+  RoundCloseResult,
+  RoundInfo,
+  Milestone,
+  MilestoneStatus,
+  MilestoneResult,
+  ReferralClaimResult,
+  ReferralPayResult,
+  PayerRefund,
 } from "./types.js";
 import {
   estimateBridgeFee as _estimateBridgeFee,
@@ -204,6 +213,9 @@ import {
   InvoiceIntegrityError,
   InvoiceNotCloneableError,
   InvalidTransactionTypeError,
+  RoundNotEndedError,
+  WrongMilestoneError,
+  NothingToClaimError,
 } from "./errors.js";
 import { hashInvoice, verifyInvoiceHash } from "./invoiceHashVerifier.js";
 import { buildFeeBump } from "./feeBumpBuilder.js";
@@ -9500,6 +9512,496 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
 
     return { invoiceId, txHash };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #878 — Fundraising Round methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Closes a fundraising round for the given invoice, computing pro-rata
+   * refunds for any over-subscribed payers.
+   *
+   * @throws {RoundNotEndedError} if the round_end timestamp has not yet passed.
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async closeRound(invoiceId: string): Promise<RoundCloseResult> {
+    const method = "close_round";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("RoundNotEnded") || raw?.includes("round_not_ended")) {
+          // Parse round end from context if available
+          throw new RoundNotEndedError(invoiceId, 0, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
+      const signed = await signTransaction(prepared.toXDR(), {
+        network: this.config.networkPassphrase,
+        networkPassphrase: this.config.networkPassphrase,
+        accountToSign: this.config.publicKey,
+      } as Parameters<typeof signTransaction>[1]);
+      const result = await this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
+      );
+      if (result.status === "ERROR") {
+        throw new TransactionFailedError("close_round transaction failed", result.hash);
+      }
+
+      // Parse the result — the contract returns a map of payer -> amounts
+      // We decode optimistically; real XDR parsing is contract-specific
+      const native = sim.result ? scValToNative(sim.result.retval) : null;
+      const refunds: PayerRefund[] = [];
+      let totalRaised = 0n;
+      let hardCap = 0n;
+      let overflow = 0n;
+
+      if (native && typeof native === "object") {
+        totalRaised = BigInt((native as Record<string, unknown>).total_raised ?? 0);
+        hardCap = BigInt((native as Record<string, unknown>).hard_cap ?? 0);
+        overflow = BigInt((native as Record<string, unknown>).overflow ?? 0);
+        if (Array.isArray((native as Record<string, unknown>).refunds)) {
+          for (const r of (native as Record<string, unknown>).refunds as Record<string, unknown>[]) {
+            refunds.push({
+              payer: String(r.payer),
+              amountKept: BigInt(r.amount_kept ?? 0),
+              amountRefunded: BigInt(r.amount_refunded ?? 0),
+            });
+          }
+        }
+      }
+
+      return { totalRaised, hardCap, overflow, refunds, txHash: result.hash };
+    } catch (err) {
+      if (
+        err instanceof RoundNotEndedError ||
+        err instanceof InvoiceNotFoundError ||
+        err instanceof SimulationFailedError ||
+        err instanceof TransactionFailedError
+      ) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Fetches the current state of the fundraising round for the given invoice.
+   *
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async getRoundInfo(invoiceId: string): Promise<RoundInfo> {
+    const method = "get_round_info";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : {};
+      return {
+        invoiceId,
+        totalRaised: BigInt((native as Record<string, unknown>)?.total_raised ?? 0),
+        hardCap: BigInt((native as Record<string, unknown>)?.hard_cap ?? 0),
+        roundEnd: Number((native as Record<string, unknown>)?.round_end ?? 0),
+        closed: Boolean((native as Record<string, unknown>)?.closed ?? false),
+      };
+    } catch (err) {
+      if (err instanceof InvoiceNotFoundError || err instanceof SimulationFailedError) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #879 — Milestone methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Marks the specified milestone as completed and releases funds to recipients.
+   *
+   * @throws {WrongMilestoneError} if `index` is not the currently active milestone.
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async completeMilestone(invoiceId: string, index: number): Promise<MilestoneResult> {
+    const method = "complete_milestone";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" }),
+            nativeToScVal(index, { type: "u32" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("WrongMilestone") || raw?.includes("wrong_milestone")) {
+          throw new WrongMilestoneError(invoiceId, index, -1, raw);
+        }
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
+      const signed = await signTransaction(prepared.toXDR(), {
+        network: this.config.networkPassphrase,
+        networkPassphrase: this.config.networkPassphrase,
+        accountToSign: this.config.publicKey,
+      } as Parameters<typeof signTransaction>[1]);
+      const result = await this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
+      );
+      if (result.status === "ERROR") {
+        throw new TransactionFailedError("complete_milestone transaction failed", result.hash);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : {};
+      const n = native as Record<string, unknown>;
+      return {
+        index,
+        amountReleased: BigInt(n?.amount_released ?? 0),
+        nextMilestoneIndex: n?.next_milestone_index != null ? Number(n.next_milestone_index) : undefined,
+        txHash: result.hash,
+      };
+    } catch (err) {
+      if (
+        err instanceof WrongMilestoneError ||
+        err instanceof InvoiceNotFoundError ||
+        err instanceof SimulationFailedError ||
+        err instanceof TransactionFailedError
+      ) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Returns the currently active milestone for the given invoice.
+   *
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async getActiveMilestone(invoiceId: string): Promise<Milestone | null> {
+    const method = "get_active_milestone";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : null;
+      if (!native) return null;
+      const n = native as Record<string, unknown>;
+      return {
+        index: Number(n.index ?? 0),
+        description: String(n.description ?? ""),
+        targetAmount: BigInt(n.target_amount ?? 0),
+        fundedAmount: BigInt(n.funded_amount ?? 0),
+        status: (n.status as MilestoneStatus) ?? "active",
+      };
+    } catch (err) {
+      if (err instanceof InvoiceNotFoundError || err instanceof SimulationFailedError) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Returns all milestones for the given invoice.
+   *
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async getMilestones(invoiceId: string): Promise<Milestone[]> {
+    const method = "get_milestones";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : [];
+      if (!Array.isArray(native)) return [];
+      return (native as Record<string, unknown>[]).map((n) => ({
+        index: Number(n.index ?? 0),
+        description: String(n.description ?? ""),
+        targetAmount: BigInt(n.target_amount ?? 0),
+        fundedAmount: BigInt(n.funded_amount ?? 0),
+        status: (n.status as MilestoneStatus) ?? "locked",
+      }));
+    } catch (err) {
+      if (err instanceof InvoiceNotFoundError || err instanceof SimulationFailedError) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #880 — Referral methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Claims any accumulated referral rewards for the connected wallet.
+   *
+   * @throws {NothingToClaimError} if the referral balance is zero.
+   */
+  async claimReferralRewards(): Promise<ReferralClaimResult> {
+    const method = "claim_referral_rewards";
+    const address = this.config.publicKey ?? "";
+    try {
+      const balance = await this.getReferralBalance(address);
+      if (balance === 0n) {
+        throw new NothingToClaimError(address);
+      }
+
+      const account = await this.server.getAccount(address);
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(address, { type: "address" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
+      const signed = await signTransaction(prepared.toXDR(), {
+        network: this.config.networkPassphrase,
+        networkPassphrase: this.config.networkPassphrase,
+        accountToSign: this.config.publicKey,
+      } as Parameters<typeof signTransaction>[1]);
+      const result = await this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
+      );
+      if (result.status === "ERROR") {
+        throw new TransactionFailedError("claim_referral_rewards transaction failed", result.hash);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : 0n;
+      const amountClaimed = BigInt(typeof native === "bigint" ? native : (native ?? 0));
+      return { amountClaimed, txHash: result.hash };
+    } catch (err) {
+      if (
+        err instanceof NothingToClaimError ||
+        err instanceof SimulationFailedError ||
+        err instanceof TransactionFailedError
+      ) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Returns the current referral reward balance for the given address (or the
+   * connected wallet if no address is specified).
+   */
+  async getReferralBalance(address?: string): Promise<bigint> {
+    const method = "get_referral_balance";
+    const target = address ?? this.config.publicKey ?? "";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(target, { type: "address" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : 0n;
+      return BigInt(typeof native === "bigint" ? native : (native ?? 0));
+    } catch (err) {
+      if (err instanceof SimulationFailedError) throw err;
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Pays toward an invoice while crediting a referrer address.
+   *
+   * @param invoiceId - The invoice to pay toward.
+   * @param amount - Amount to pay in stroops.
+   * @param referrer - Stellar G-address of the referrer to credit.
+   *
+   * @throws {ValidationError} if the referrer address is not a valid G-address.
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async payWithReferral(
+    invoiceId: string,
+    amount: bigint,
+    referrer: string
+  ): Promise<ReferralPayResult> {
+    const method = "pay_with_referral";
+
+    if (!isValidAddress(referrer)) {
+      throw new ValidationError(`Invalid referrer address: ${referrer}`, { referrer });
+    }
+
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" }),
+            nativeToScVal(amount, { type: "i128" }),
+            nativeToScVal(referrer, { type: "address" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
+      const signed = await signTransaction(prepared.toXDR(), {
+        network: this.config.networkPassphrase,
+        networkPassphrase: this.config.networkPassphrase,
+        accountToSign: this.config.publicKey,
+      } as Parameters<typeof signTransaction>[1]);
+      const result = await this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
+      );
+      if (result.status === "ERROR") {
+        throw new TransactionFailedError("pay_with_referral transaction failed", result.hash);
+      }
+
+      return { txHash: result.hash, referrer };
+    } catch (err) {
+      if (
+        err instanceof ValidationError ||
+        err instanceof InvoiceNotFoundError ||
+        err instanceof SimulationFailedError ||
+        err instanceof TransactionFailedError
+      ) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
   }
 }
 
