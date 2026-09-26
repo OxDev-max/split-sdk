@@ -115,6 +115,59 @@ new StellarSplitClient(config: StellarSplitClientConfig)
 | `pay(params)` | `Promise<{ txHash }>` | Pay toward an invoice |
 | `getInvoice(id)` | `Promise<Invoice>` | Fetch invoice by ID |
 | `getPayments(id)` | `Promise<Payment[]>` | Fetch payments for an invoice |
+| `queryInvoices(filter)` | `Promise<InvoicePage>` | Filter, sort and paginate a creator's invoices with one typed query |
+
+### Invoice Query Engine
+
+`queryInvoices()` composes every filter into a single query object. All supplied
+fields combine with AND; within a field, `status` matches any listed state
+while `tags` requires every listed tag.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `creator` | `string` | **Required** — the contract has no global invoice index, so queries are scoped to one creator |
+| `status` | `InvoiceStatus[]` | Match any of these lifecycle states |
+| `minAmount` / `maxAmount` | `bigint` | Inclusive bounds on the invoice total (sum of recipients), in stroops |
+| `fromDate` / `toDate` | `number` | Inclusive bounds on `createdAt`; accepts Unix seconds or milliseconds |
+| `tags` | `string[]` | Match invoices carrying **all** of these tags (case-insensitive) |
+| `sort` | `'newest' \| 'oldest' \| 'highest' \| 'lowest'` | Defaults to `newest` |
+| `limit` | `number` | Page size, defaults to 20 |
+| `cursor` | `string` | Opaque cursor from a previous `nextCursor` |
+
+Returns an `InvoicePage`: `{ items, nextCursor?, total }`. `total` always counts
+every match across all pages; `nextCursor` is omitted on the final page.
+
+```ts
+const page = await client.queryInvoices({
+  creator: "GABC...",
+  status: ["Pending", "Released"],
+  minAmount: 1_000_000n,
+  tags: ["urgent"],
+  sort: "highest",
+  limit: 10,
+});
+
+let cursor = page.nextCursor;
+while (cursor) {
+  const next = await client.queryInvoices({ creator: "GABC...", cursor });
+  cursor = next.nextCursor;
+}
+```
+
+Because the contract exposes no status/amount/date query, this fetches the
+creator's invoice IDs and filters in memory. To search an invoice list you
+already hold (no network calls), use the exported engine directly:
+
+```ts
+import { InvoiceQueryEngine } from "@stellar-split/sdk";
+
+const page = new InvoiceQueryEngine(invoices).query({ status: ["Pending"] });
+const index = new InvoiceQueryEngine(invoices).tagIndex();
+index.getByTag("urgent"); // invoices tagged "urgent"
+```
+
+Tags come from an invoice's `tags` field, falling back to `#hashtags` parsed
+out of its `memo`, so existing invoices are taggable without a contract change.
 
 ### Wallet Helpers
 
