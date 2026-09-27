@@ -18,6 +18,16 @@ export interface MethodCacheEntry {
   expiresAt: number;
 }
 
+export type CacheEventType = "set" | "hit" | "miss" | "expire" | "invalidate" | "evict";
+
+export interface CacheEvent {
+  type: CacheEventType;
+  key: string;
+  timestamp: number;
+}
+
+export type CacheEventListener = (event: CacheEvent) => void;
+
 export class SimpleCache<T> {
   private readonly store = new Map<string, MethodCacheEntry>();
   private readonly ttlConfig: Record<string, number>;
@@ -26,6 +36,7 @@ export class SimpleCache<T> {
   private misses = 0;
   private evictions = 0;
   private maxEntries: number;
+  private readonly listeners = new Set<CacheEventListener>();
 
   constructor(config?: number | { enabled?: boolean; ttl?: Record<string, number>; ttlMs?: number; maxEntries?: number }) {
     if (typeof config === "number") {
@@ -42,16 +53,38 @@ export class SimpleCache<T> {
     }
   }
 
+  /**
+   * Subscribe to cache lifecycle events (set, hit, miss, expire, invalidate,
+   * evict).  Returns an unsubscribe function.
+   */
+  on(listener: CacheEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emit(type: CacheEventType, key: string): void {
+    if (this.listeners.size === 0) return;
+    const event: CacheEvent = { type, key, timestamp: Date.now() };
+    for (const listener of this.listeners) {
+      listener(event);
+    }
+  }
+
   get(key: string): T | undefined {
     if (!this.enabled) return undefined;
     const entry = this.store.get(key);
     if (!entry) {
       this.misses++;
+      this.emit("miss", key);
       return undefined;
     }
     if (Date.now() > entry.expiresAt) {
       this.store.delete(key);
       this.misses++;
+      this.emit("expire", key);
+      this.emit("miss", key);
       return undefined;
     }
     
@@ -60,6 +93,7 @@ export class SimpleCache<T> {
     this.store.set(key, entry);
 
     this.hits++;
+    this.emit("hit", key);
     return entry.value;
   }
 
@@ -74,26 +108,35 @@ export class SimpleCache<T> {
       if (oldestKey !== undefined) {
         this.store.delete(oldestKey);
         this.evictions++;
+        this.emit("evict", oldestKey);
       }
     }
 
     this.store.set(key, { value, expiresAt: Date.now() + ttl });
+    this.emit("set", key);
   }
 
   invalidate(methodOrKey?: string, args?: any[]): void {
     if (!methodOrKey) {
+      const keys = Array.from(this.store.keys());
       this.store.clear();
+      for (const key of keys) {
+        this.emit("invalidate", key);
+      }
       return;
     }
     if (args) {
       const key = `${methodOrKey}:${JSON.stringify(args)}`;
-      this.store.delete(key);
+      if (this.store.delete(key)) {
+        this.emit("invalidate", key);
+      }
       return;
     }
     
     // Check if it's an exact key
     if (this.store.has(methodOrKey)) {
       this.store.delete(methodOrKey);
+      this.emit("invalidate", methodOrKey);
     }
     
     // Invalidate by method prefix
@@ -101,6 +144,7 @@ export class SimpleCache<T> {
     for (const key of this.store.keys()) {
       if (key.startsWith(prefix)) {
         this.store.delete(key);
+        this.emit("invalidate", key);
       }
     }
   }
@@ -114,6 +158,7 @@ export class SimpleCache<T> {
     for (const [key, entry] of this.store.entries()) {
       if (now > entry.expiresAt) {
         this.store.delete(key);
+        this.emit("expire", key);
       }
     }
     return {
@@ -163,6 +208,7 @@ interface CacheEntry<V> {
 export class Cache<V> {
   private readonly store = new Map<string, CacheEntry<V>>();
   private readonly ttlMs: number | undefined;
+  private readonly listeners = new Set<CacheEventListener>();
 
   /**
    * @param ttlMs  Time-to-live in milliseconds.  Omit (or pass `undefined`)
@@ -173,10 +219,30 @@ export class Cache<V> {
   }
 
   /**
+   * Subscribe to cache lifecycle events (set, hit, miss, expire, invalidate).
+   * Returns an unsubscribe function.
+   */
+  on(listener: CacheEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emit(type: CacheEventType, key: string): void {
+    if (this.listeners.size === 0) return;
+    const event: CacheEvent = { type, key, timestamp: Date.now() };
+    for (const listener of this.listeners) {
+      listener(event);
+    }
+  }
+
+  /**
    * Store `value` under `key`, recording the current wall-clock time.
    */
   set(key: string, value: V): void {
     this.store.set(key, { value, writtenAt: Date.now() });
+    this.emit("set", key);
   }
 
   /**
@@ -188,11 +254,17 @@ export class Cache<V> {
    */
   get(key: string): V | undefined {
     const entry = this.store.get(key);
-    if (!entry) return undefined;
-    if (this.isExpired(entry)) {
-      this.store.delete(key);
+    if (!entry) {
+      this.emit("miss", key);
       return undefined;
     }
+    if (this.isExpired(entry)) {
+      this.store.delete(key);
+      this.emit("expire", key);
+      this.emit("miss", key);
+      return undefined;
+    }
+    this.emit("hit", key);
     return entry.value;
   }
 
@@ -205,6 +277,7 @@ export class Cache<V> {
     if (!entry) return false;
     if (this.isExpired(entry)) {
       this.store.delete(key);
+      this.emit("expire", key);
       return false;
     }
     return true;
@@ -219,18 +292,25 @@ export class Cache<V> {
     for (const [key, entry] of this.store) {
       if (this.isExpired(entry)) {
         this.store.delete(key);
+        this.emit("expire", key);
       }
     }
   }
 
   /** Remove a specific entry by key. */
   delete(key: string): void {
-    this.store.delete(key);
+    if (this.store.delete(key)) {
+      this.emit("invalidate", key);
+    }
   }
 
   /** Remove all entries. */
   clear(): void {
+    const keys = Array.from(this.store.keys());
     this.store.clear();
+    for (const key of keys) {
+      this.emit("invalidate", key);
+    }
   }
 
   /** Number of entries currently in the store (including not-yet-evicted expired ones). */
