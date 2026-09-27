@@ -12,6 +12,28 @@ export interface AuditEntry {
   decodedXdr?: DecodedXDR;
 }
 
+/**
+ * A single audit event emitted by the SDK for compliance tracking.
+ *
+ * Unlike {@link AuditEntry}, which is a low-level sink record, an
+ * `AuditEvent` carries a stable `type` discriminator and a monotonically
+ * increasing `sequence` so downstream consumers can order and reconcile
+ * events reliably.
+ */
+export interface AuditEvent {
+  /** Stable event type discriminator, e.g. `"audit.log"`. */
+  type: string;
+  /** Monotonically increasing sequence number, starting at 1. */
+  sequence: number;
+  /** Wall-clock time the event was emitted (ms since epoch). */
+  timestamp: number;
+  /** The audit entry associated with this event. */
+  entry: AuditEntry;
+}
+
+/** Handler invoked for every emitted {@link AuditEvent}. */
+export type AuditEventListener = (event: AuditEvent) => void;
+
 const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
 
 /** Detect if a string value looks like base64-encoded XDR. */
@@ -23,13 +45,55 @@ const MIN_XDR_LENGTH = 40;
 export class AuditLogger {
   private readonly sink: (entry: AuditEntry) => void;
   private readonly splitAuditTrails = new Map<string, SplitAuditEntry[]>();
+  private readonly listeners = new Set<AuditEventListener>();
+  private sequence = 0;
 
   constructor(sink: (entry: AuditEntry) => void) {
     this.sink = sink;
   }
 
+  /**
+   * Subscribe to audit events. Returns an unsubscribe function.
+   *
+   * Listeners are invoked synchronously after the entry has been written to
+   * the configured sink, so a throwing listener can never prevent the audit
+   * record from being persisted.
+   */
+  on(listener: AuditEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** Remove a previously registered listener. */
+  off(listener: AuditEventListener): void {
+    this.listeners.delete(listener);
+  }
+
+  /** Emit an audit event to all registered listeners. */
+  private emit(entry: AuditEntry): void {
+    if (this.listeners.size === 0) {
+      return;
+    }
+    const event: AuditEvent = {
+      type: "audit.log",
+      sequence: ++this.sequence,
+      timestamp: entry.timestamp,
+      entry,
+    };
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A misbehaving listener must never break audit logging.
+      }
+    }
+  }
+
   log(entry: AuditEntry): void {
     this.sink(entry);
+    this.emit(entry);
   }
 
   sanitize(params: Record<string, unknown>): Record<string, unknown> {
