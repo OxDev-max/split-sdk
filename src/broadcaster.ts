@@ -42,6 +42,53 @@ export type FeeEstimationEvent = "estimate" | "error";
 type FeeEstimationHandler = (event: FeeEstimationEvent, payload: FeeEstimate | Error) => void;
 
 /**
+ * A candidate payment pathway with its associated cost and reliability.
+ */
+export interface PaymentPathway {
+  /** Identifier of the pathway (e.g. channel or route id). */
+  id: string;
+  /** Estimated fee rate for routing through this pathway, in sat/vB. */
+  feeRate: number;
+  /** Estimated probability (0..1) that the payment succeeds via this pathway. */
+  successProbability: number;
+  /** Optional available liquidity along the pathway, in the smallest unit. */
+  liquidity?: number;
+}
+
+/**
+ * A scored payment pathway produced by the optimizer.
+ */
+export interface ScoredPaymentPathway extends PaymentPathway {
+  /** Composite score; higher is better. */
+  score: number;
+}
+
+/**
+ * Result of a payment pathway optimization run.
+ */
+export interface PaymentPathwayOptimization {
+  /** Pathways ordered from best to worst by score. */
+  pathways: ScoredPaymentPathway[];
+  /** The recommended pathway, or null when no candidates were provided. */
+  recommended: ScoredPaymentPathway | null;
+  /** Number of candidate pathways that were evaluated. */
+  evaluatedCount: number;
+}
+
+/**
+ * Event names emitted during the payment pathway optimization lifecycle.
+ */
+export type PaymentPathwayEvent = "optimized" | "error";
+
+/**
+ * Handler invoked when a payment pathway optimization event is emitted.
+ */
+type PaymentPathwayHandler = (
+  event: PaymentPathwayEvent,
+  payload: PaymentPathwayOptimization | Error,
+) => void;
+
+/**
  * Invoice state broadcaster that publishes state changes to multiple subscribers.
  */
 export class InvoiceStateBroadcaster {
@@ -217,4 +264,89 @@ export class FeeEstimator {
  */
 export function createFeeEstimator(): FeeEstimator {
   return new FeeEstimator();
+}
+
+/**
+ * Optimizes payment pathways by scoring candidates on cost and reliability.
+ *
+ * Each candidate is scored so that cheaper fees and higher success
+ * probabilities rank higher. The optimizer emits lifecycle events so callers
+ * can react to optimization results and errors.
+ */
+export class PaymentPathwayOptimizer {
+  private handlers: Set<PaymentPathwayHandler> = new Set();
+
+  /**
+   * Subscribe to payment pathway optimization lifecycle events.
+   *
+   * @param handler - Handler invoked on "optimized" and "error" events
+   * @returns Unsubscribe function that removes only this handler
+   */
+  on(handler: PaymentPathwayHandler): () => void {
+    this.handlers.add(handler);
+    return () => {
+      this.handlers.delete(handler);
+    };
+  }
+
+  /**
+   * Score a single payment pathway.
+   *
+   * The score rewards higher success probability and penalizes higher fees.
+   * A zero or negative fee rate is treated as the cheapest possible pathway.
+   *
+   * @param pathway - The candidate pathway to score
+   * @returns The pathway annotated with its composite score
+   */
+  scorePathway(pathway: PaymentPathway): ScoredPaymentPathway {
+    const probability = Math.min(Math.max(pathway.successProbability, 0), 1);
+    const feeRate = pathway.feeRate > 0 ? pathway.feeRate : 1;
+    const score = probability / feeRate;
+    return { ...pathway, score };
+  }
+
+  /**
+   * Optimize a set of candidate payment pathways.
+   *
+   * @param pathways - The candidate pathways to evaluate
+   * @returns The optimization result, ordered from best to worst
+   */
+  optimize(pathways: PaymentPathway[]): PaymentPathwayOptimization {
+    try {
+      const scored = pathways
+        .map((pathway) => this.scorePathway(pathway))
+        .sort((a, b) => b.score - a.score);
+
+      const result: PaymentPathwayOptimization = {
+        pathways: scored,
+        recommended: scored.length > 0 ? scored[0] : null,
+        evaluatedCount: scored.length,
+      };
+
+      this.emit("optimized", result);
+      return result;
+    } catch (error) {
+      this.emit("error", error instanceof Error ? error : new Error(String(error)));
+      return { pathways: [], recommended: null, evaluatedCount: 0 };
+    }
+  }
+
+  private emit(event: PaymentPathwayEvent, payload: PaymentPathwayOptimization | Error): void {
+    this.handlers.forEach((handler) => {
+      try {
+        handler(event, payload);
+      } catch (error) {
+        console.error(`Error in payment pathway handler for ${event}:`, error);
+      }
+    });
+  }
+}
+
+/**
+ * Creates a new PaymentPathwayOptimizer instance.
+ *
+ * @returns A new PaymentPathwayOptimizer instance
+ */
+export function createPaymentPathwayOptimizer(): PaymentPathwayOptimizer {
+  return new PaymentPathwayOptimizer();
 }
