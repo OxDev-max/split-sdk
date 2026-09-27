@@ -31,6 +31,45 @@ export interface SignerWeightResult {
   missingWeight: number;
 }
 
+/**
+ * A single signer entry used when building a multi-signature transaction.
+ */
+export interface MultiSigSigner {
+  /** The signer's public key (G… address, pre-auth tx, or hash(x)). */
+  key: string;
+  /** The weight this signer contributes toward the threshold. */
+  weight: number;
+}
+
+/**
+ * A fully-built multi-signature transaction plan.
+ */
+export interface MultiSigTransaction {
+  /** The account that owns the transaction. */
+  accountId: string;
+  /** The threshold level the transaction must satisfy. */
+  threshold: ThresholdLevel;
+  /** The signers that will be required to sign. */
+  signers: MultiSigSigner[];
+  /** The total weight contributed by the configured signers. */
+  totalWeight: number;
+  /** The threshold value required for the requested level. */
+  requiredThreshold: number;
+  /** Whether the configured signers satisfy the required threshold. */
+  sufficient: boolean;
+}
+
+/**
+ * Events emitted by the MultiSigTransactionBuilder during its lifecycle.
+ */
+export type MultiSigBuilderEvent =
+  | { type: "signerAdded"; signer: MultiSigSigner }
+  | { type: "signerRemoved"; key: string }
+  | { type: "thresholdSet"; threshold: ThresholdLevel }
+  | { type: "built"; transaction: MultiSigTransaction };
+
+export type MultiSigBuilderListener = (event: MultiSigBuilderEvent) => void;
+
 // ---------------------------------------------------------------------------
 // Cache entry
 // ---------------------------------------------------------------------------
@@ -181,6 +220,117 @@ export class AccountSignerWeightCalculator {
         return account.thresholds.med_threshold;
       case "high":
         return account.thresholds.high_threshold;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MultiSigTransactionBuilder
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds multi-signature transaction plans by collecting signers and a target
+ * threshold, then validating the collected weight against the account's
+ * on-chain thresholds via {@link AccountSignerWeightCalculator}.
+ *
+ * Emits lifecycle events so callers can react to signer/threshold changes and
+ * to the final build result.
+ *
+ * Issue #914
+ */
+export class MultiSigTransactionBuilder {
+  private readonly calculator: AccountSignerWeightCalculator;
+  private readonly accountId: string;
+  private readonly signers = new Map<string, MultiSigSigner>();
+  private readonly listeners = new Set<MultiSigBuilderListener>();
+  private threshold: ThresholdLevel = "medium";
+
+  constructor(accountId: string, calculator: AccountSignerWeightCalculator) {
+    this.accountId = accountId;
+    this.calculator = calculator;
+  }
+
+  /**
+   * Register a listener for builder lifecycle events.
+   *
+   * @returns An unsubscribe function that removes the listener.
+   */
+  on(listener: MultiSigBuilderListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /**
+   * Add a signer to the transaction. Re-adding an existing key updates its weight.
+   */
+  addSigner(key: string, weight: number): this {
+    const signer: MultiSigSigner = { key, weight };
+    this.signers.set(key, signer);
+    this._emit({ type: "signerAdded", signer });
+    return this;
+  }
+
+  /**
+   * Remove a signer by key. No-op if the key is not present.
+   */
+  removeSigner(key: string): this {
+    if (this.signers.delete(key)) {
+      this._emit({ type: "signerRemoved", key });
+    }
+    return this;
+  }
+
+  /**
+   * Set the threshold level the transaction must satisfy.
+   */
+  setThreshold(threshold: ThresholdLevel): this {
+    this.threshold = threshold;
+    this._emit({ type: "thresholdSet", threshold });
+    return this;
+  }
+
+  /**
+   * The signers currently configured on the builder.
+   */
+  getSigners(): MultiSigSigner[] {
+    return Array.from(this.signers.values());
+  }
+
+  /**
+   * Build the multi-signature transaction plan, validating the configured
+   * signers against the account's on-chain thresholds.
+   *
+   * @throws {InsufficientSignerWeightError} when the configured signers do not
+   *   meet the required threshold.
+   */
+  async build(): Promise<MultiSigTransaction> {
+    const signers = this.getSigners();
+    const keys = signers.map((s) => s.key);
+
+    const result = await this.calculator.calculateWeight(this.accountId, keys, this.threshold);
+
+    if (!result.sufficient) {
+      throw new InsufficientSignerWeightError(keys, result.totalWeight, result.requiredThreshold);
+    }
+
+    const transaction: MultiSigTransaction = {
+      accountId: this.accountId,
+      threshold: this.threshold,
+      signers,
+      totalWeight: result.totalWeight,
+      requiredThreshold: result.requiredThreshold,
+      sufficient: result.sufficient,
+    };
+
+    this._emit({ type: "built", transaction });
+    return transaction;
+  }
+
+  private _emit(event: MultiSigBuilderEvent): void {
+    for (const listener of this.listeners) {
+      listener(event);
     }
   }
 }

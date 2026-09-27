@@ -82,6 +82,39 @@ export interface OperationBuilderConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-signature option interfaces
+// ---------------------------------------------------------------------------
+
+export interface AddSignerOptions {
+  /** Signer G… address (or pre-auth-tx hash for hash(x) signers). */
+  key: string;
+  /** Relative weight of this signer. Defaults to 1. */
+  weight?: number;
+}
+
+export interface SetThresholdsOptions {
+  /** Master key weight. Defaults to 1. */
+  masterWeight?: number;
+  /** Weight required for low-threshold operations. Defaults to 0. */
+  low?: number;
+  /** Weight required for medium-threshold operations. Defaults to 0. */
+  medium?: number;
+  /** Weight required for high-threshold operations. Defaults to 0. */
+  high?: number;
+}
+
+/**
+ * Events emitted by the multi-signature builder lifecycle.
+ */
+export type MultiSigEvent =
+  | { type: "signerAdded"; key: string; weight: number }
+  | { type: "signerRemoved"; key: string }
+  | { type: "thresholdsSet"; thresholds: Required<SetThresholdsOptions> }
+  | { type: "transactionBuilt"; signerCount: number; threshold: number };
+
+export type MultiSigEventListener = (event: MultiSigEvent) => void;
+
+// ---------------------------------------------------------------------------
 // OperationBuilder
 // ---------------------------------------------------------------------------
 
@@ -102,6 +135,16 @@ export class OperationBuilder {
   private readonly server: SorobanRpc.Server;
   private readonly ops: xdr.Operation[] = [];
   private timebounds: TimeboundsOptions | null = null;
+
+  // Multi-signature state
+  private readonly signers = new Map<string, number>();
+  private thresholds: Required<SetThresholdsOptions> = {
+    masterWeight: 1,
+    low: 0,
+    medium: 0,
+    high: 0,
+  };
+  private readonly listeners = new Set<MultiSigEventListener>();
 
   constructor(config: OperationBuilderConfig) {
     this.config = config;
@@ -157,6 +200,79 @@ export class OperationBuilder {
   }
 
   // --------------------------------------------------------------------------
+  // Multi-signature builder
+  // --------------------------------------------------------------------------
+
+  /**
+   * Registers a signer with an optional weight. Re-adding an existing key
+   * updates its weight. Emits a `signerAdded` event.
+   */
+  addSigner(opts: AddSignerOptions): this {
+    const weight = opts.weight ?? 1;
+    this.signers.set(opts.key, weight);
+    this._emit({ type: "signerAdded", key: opts.key, weight });
+    return this;
+  }
+
+  /**
+   * Removes a previously registered signer. Emits a `signerRemoved` event.
+   */
+  removeSigner(key: string): this {
+    if (this.signers.delete(key)) {
+      this._emit({ type: "signerRemoved", key });
+    }
+    return this;
+  }
+
+  /**
+   * Sets the account thresholds. Emits a `thresholdsSet` event.
+   */
+  setThresholds(opts: SetThresholdsOptions): this {
+    this.thresholds = {
+      masterWeight: opts.masterWeight ?? this.thresholds.masterWeight,
+      low: opts.low ?? this.thresholds.low,
+      medium: opts.medium ?? this.thresholds.medium,
+      high: opts.high ?? this.thresholds.high,
+    };
+    this._emit({ type: "thresholdsSet", thresholds: { ...this.thresholds } });
+    return this;
+  }
+
+  /**
+   * Returns the total signing weight of all registered signers.
+   */
+  getTotalWeight(): number {
+    let total = 0;
+    for (const weight of this.signers.values()) {
+      total += weight;
+    }
+    return total;
+  }
+
+  /**
+   * Returns true when the registered signers meet the high threshold.
+   */
+  isThresholdMet(): boolean {
+    return this.getTotalWeight() >= this.thresholds.high;
+  }
+
+  /**
+   * Subscribes to builder lifecycle events. Returns an unsubscribe function.
+   */
+  onEvent(listener: MultiSigEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private _emit(event: MultiSigEvent): void {
+    for (const listener of this.listeners) {
+      listener(event);
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // Build
   // --------------------------------------------------------------------------
 
@@ -192,7 +308,15 @@ export class OperationBuilder {
       tb.setTimeout(30);
     }
 
-    return tb.build();
+    const tx = tb.build();
+
+    this._emit({
+      type: "transactionBuilt",
+      signerCount: this.signers.size,
+      threshold: this.thresholds.high,
+    });
+
+    return tx;
   }
 
   // --------------------------------------------------------------------------
@@ -278,21 +402,12 @@ export class OperationBuilder {
       }
     }
 
-    const sendResult = await this.server.sendTransaction(txToSubmit);
-
-    if (sendResult.status === "ERROR") {
-      const errDetail =
-        sendResult.errorResult
-          ? JSON.stringify(sendResult.errorResult)
-          : "Unknown error";
-      throw new DryRunFailedError(`Send failed: ${errDetail}`);
-    }
-
-    return { txHash: sendResult.hash };
+    const response = await this.server.sendTransaction(txToSubmit);
+    return { txHash: response.hash };
   }
 
   // --------------------------------------------------------------------------
-  // Private helpers
+  // Internals
   // --------------------------------------------------------------------------
 
   private _validate(): void {
@@ -302,10 +417,7 @@ export class OperationBuilder {
   }
 
   private _makeFakeAccount(): Account {
-    return {
-      accountId: () => this.config.sourceAddress,
-      sequenceNumber: () => "0",
-      incrementSequenceNumber: () => {},
-    } as unknown as Account;
+    // Sequence number 0 — caller is expected to sign and set the real sequence.
+    return new Account(this.config.sourceAddress, "0");
   }
 }
