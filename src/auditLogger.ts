@@ -12,6 +12,47 @@ export interface AuditEntry {
   decodedXdr?: DecodedXDR;
 }
 
+/**
+ * Optional analytics dashboard export payload.
+ *
+ * Aggregates the audit entries observed by an {@link AuditLogger} into a
+ * serializable shape suitable for an analytics dashboard. Export is opt-in:
+ * it is only produced when {@link AuditLogger.exportAnalyticsDashboard} is
+ * called, so default logging behavior is unchanged.
+ */
+export interface AnalyticsDashboardExport {
+  /** ISO timestamp of when the export was generated. */
+  generatedAt: string;
+  /** Total number of audit entries included in the export. */
+  totalEntries: number;
+  /** Number of successful entries. */
+  successCount: number;
+  /** Number of failed entries. */
+  failureCount: number;
+  /** Aggregate duration across all entries, in milliseconds. */
+  totalDurationMs: number;
+  /** Per-method breakdown of entry counts and durations. */
+  methods: Record<string, { count: number; totalDurationMs: number }>;
+  /** The raw audit entries included in the export. */
+  entries: AuditEntry[];
+}
+
+/** Lifecycle events emitted while producing an analytics dashboard export. */
+export type AnalyticsExportEvent =
+  | { type: "export_start"; entryCount: number }
+  | { type: "export_complete"; export: AnalyticsDashboardExport }
+  | { type: "export_error"; error: Error };
+
+/** Options controlling an analytics dashboard export. */
+export interface AnalyticsExportOptions {
+  /** Optional inclusive lower bound (epoch ms) on entry timestamps. */
+  since?: number;
+  /** Optional inclusive upper bound (epoch ms) on entry timestamps. */
+  until?: number;
+  /** Optional listener for export lifecycle events. */
+  onEvent?: (event: AnalyticsExportEvent) => void;
+}
+
 const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
 
 /** Detect if a string value looks like base64-encoded XDR. */
@@ -23,12 +64,14 @@ const MIN_XDR_LENGTH = 40;
 export class AuditLogger {
   private readonly sink: (entry: AuditEntry) => void;
   private readonly splitAuditTrails = new Map<string, SplitAuditEntry[]>();
+  private readonly entries: AuditEntry[] = [];
 
   constructor(sink: (entry: AuditEntry) => void) {
     this.sink = sink;
   }
 
   log(entry: AuditEntry): void {
+    this.entries.push(entry);
     this.sink(entry);
   }
 
@@ -137,5 +180,73 @@ export class AuditLogger {
    */
   async exportSplitAuditTrail(invoiceId: string): Promise<SplitAuditEntry[]> {
     return [...(this.splitAuditTrails.get(invoiceId) ?? [])];
+  }
+
+  /**
+   * Produce an optional analytics dashboard export from the audit entries
+   * observed so far.
+   *
+   * This is opt-in: nothing is exported unless this method is called, so
+   * existing default logging behavior is unaffected. Lifecycle events
+   * (`export_start`, `export_complete`, `export_error`) are emitted through
+   * `options.onEvent` when provided.
+   *
+   * @param options - Optional time-range filter and event listener.
+   * @returns A serializable {@link AnalyticsDashboardExport}.
+   */
+  exportAnalyticsDashboard(
+    options: AnalyticsExportOptions = {},
+  ): AnalyticsDashboardExport {
+    const { since, until, onEvent } = options;
+
+    const selected = this.entries.filter((entry) => {
+      if (since !== undefined && entry.timestamp < since) return false;
+      if (until !== undefined && entry.timestamp > until) return false;
+      return true;
+    });
+
+    onEvent?.({ type: "export_start", entryCount: selected.length });
+
+    try {
+      let successCount = 0;
+      let failureCount = 0;
+      let totalDurationMs = 0;
+      const methods: Record<string, { count: number; totalDurationMs: number }> =
+        {};
+
+      for (const entry of selected) {
+        if (entry.success) {
+          successCount += 1;
+        } else {
+          failureCount += 1;
+        }
+        totalDurationMs += entry.durationMs;
+
+        const bucket = methods[entry.method] ?? {
+          count: 0,
+          totalDurationMs: 0,
+        };
+        bucket.count += 1;
+        bucket.totalDurationMs += entry.durationMs;
+        methods[entry.method] = bucket;
+      }
+
+      const result: AnalyticsDashboardExport = {
+        generatedAt: new Date().toISOString(),
+        totalEntries: selected.length,
+        successCount,
+        failureCount,
+        totalDurationMs,
+        methods,
+        entries: selected.map((entry) => ({ ...entry })),
+      };
+
+      onEvent?.({ type: "export_complete", export: result });
+      return result;
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      onEvent?.({ type: "export_error", error });
+      throw error;
+    }
   }
 }
