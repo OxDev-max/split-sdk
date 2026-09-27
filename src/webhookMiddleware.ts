@@ -343,483 +343,318 @@ function hexToBytes(hex: string): Uint8Array {
  */
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
-    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
 /**
- * Constant-time comparison of two byte arrays.
- * Prevents timing side-channel attacks during signature verification.
- * 
- * This implementation uses bitwise XOR to accumulate differences,
- * ensuring the comparison time is independent of where differences occur.
+ * Constant-time comparison of two byte arrays to prevent timing attacks.
+ * Returns true if arrays are equal, false otherwise.
  */
-function constantTimeCompare(a: Uint8Array, b: Uint8Array): boolean {
-  // Length must match - but don't return early to maintain constant time
+function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) {
     return false;
   }
 
-  let diff = 0;
+  let result = 0;
   for (let i = 0; i < a.length; i++) {
-    // Use ?? 0 to satisfy TypeScript's noUncheckedIndexedAccess
-    const byteA = a[i] ?? 0;
-    const byteB = b[i] ?? 0;
-    diff |= byteA ^ byteB;
+    result |= a[i] ^ b[i];
   }
 
-  return diff === 0;
+  return result === 0;
+}
+
+// ============================================================================
+// Signature Validation
+// ============================================================================
+
+/**
+ * Compute the HMAC-SHA256 signature for a webhook payload.
+ * The signed message is `${timestamp}.${rawBody}` to bind the timestamp
+ * to the payload and prevent timestamp tampering.
+ *
+ * @param secret - The shared webhook secret
+ * @param timestamp - Unix timestamp in seconds
+ * @param rawBody - The raw request body as a string
+ * @returns Hex-encoded signature string
+ */
+export async function computeSignature(
+  secret: string,
+  timestamp: number | string,
+  rawBody: string,
+): Promise<string> {
+  const message = `${timestamp}.${rawBody}`;
+  const digest = await computeHmacSha256(secret, message);
+  return bytesToHex(digest);
 }
 
 /**
- * Verify HMAC-SHA256 signature in constant time.
- * 
- * @param payload - The original payload string
- * @param signature - Hex-encoded HMAC signature
- * @param secret - Shared secret key
- * @returns True if signature is valid
+ * Verify a webhook signature against the expected HMAC-SHA256 digest.
+ * Uses constant-time comparison to prevent timing attacks.
+ *
+ * @param secret - The shared webhook secret
+ * @param timestamp - Unix timestamp in seconds
+ * @param rawBody - The raw request body as a string
+ * @param signature - The hex-encoded signature to verify
+ * @returns True if the signature is valid, false otherwise
  */
-async function verifySignature(
-  payload: string,
-  signature: string,
+export async function verifySignature(
   secret: string,
+  timestamp: number | string,
+  rawBody: string,
+  signature: string,
 ): Promise<boolean> {
-  try {
-    const expectedBytes = await computeHmacSha256(secret, payload);
-    const providedBytes = hexToBytes(signature);
-    return constantTimeCompare(expectedBytes, providedBytes);
-  } catch (error) {
-    // Log error but return false (invalid signature)
+  if (!secret || !signature) {
     return false;
   }
+
+  let providedBytes: Uint8Array;
+  try {
+    providedBytes = hexToBytes(signature);
+  } catch {
+    return false;
+  }
+
+  const expectedHex = await computeSignature(secret, timestamp, rawBody);
+  const expectedBytes = hexToBytes(expectedHex);
+
+  return constantTimeEqual(expectedBytes, providedBytes);
 }
 
 // ============================================================================
-// Webhook Middleware Error Classes
+// Webhook Event Handling
 // ============================================================================
 
 /**
- * Base error class for webhook validation failures.
+ * Handler function invoked for a validated webhook event.
  */
-export class WebhookValidationError extends ValidationError {
-  constructor(message: string, context?: Record<string, unknown>) {
-    super(message, context);
-    this.name = "WebhookValidationError";
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
+export type WebhookEventHandler<T = unknown> = (
+  payload: WebhookPayload<T>,
+) => void | Promise<void>;
 
 /**
- * Error thrown when webhook signature verification fails.
+ * Simple typed event emitter for dispatching validated webhook events.
+ * Supports multiple listeners per event and a wildcard "*" listener.
  */
-export class InvalidSignatureError extends WebhookValidationError {
-  constructor(message = "Invalid webhook signature") {
-    super(message);
-    this.name = "InvalidSignatureError";
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
+export class WebhookEventEmitter {
+  private readonly listeners: Map<string, Set<WebhookEventHandler>> = new Map();
 
-/**
- * Error thrown when webhook timestamp is outside tolerance window.
- */
-export class TimestampOutOfBoundsError extends WebhookValidationError {
-  constructor(
-    public readonly timestamp: number,
-    public readonly tolerance: number,
-  ) {
-    super("Webhook timestamp outside tolerance window", {
-      timestamp,
-      tolerance,
-      now: Math.floor(Date.now() / 1000),
+  /**
+   * Register a listener for a specific event type, or "*" for all events.
+   * @returns An unsubscribe function.
+   */
+  on<T = unknown>(
+    event: InvoiceEventType | "*",
+    handler: WebhookEventHandler<T>,
+  ): () => void {
+    let set = this.listeners.get(event);
+    if (!set) {
+      set = new Set();
+      this.listeners.set(event, set);
+    }
+    set.add(handler as WebhookEventHandler);
+
+    return () => {
+      set?.delete(handler as WebhookEventHandler);
+    };
+  }
+
+  /**
+   * Register a one-time listener for a specific event type.
+   */
+  once<T = unknown>(
+    event: InvoiceEventType | "*",
+    handler: WebhookEventHandler<T>,
+  ): () => void {
+    const unsubscribe = this.on<T>(event, async (payload) => {
+      unsubscribe();
+      await handler(payload);
     });
-    this.name = "TimestampOutOfBoundsError";
-    Object.setPrototypeOf(this, new.target.prototype);
+    return unsubscribe;
   }
-}
 
-/**
- * Error thrown when a webhook nonce has been seen before (replay attack).
- */
-export class ReplayAttackError extends WebhookValidationError {
-  constructor(public readonly nonce: string) {
-    super("Webhook nonce has already been used (replay attack detected)", {
-      nonce,
-    });
-    this.name = "ReplayAttackError";
-    Object.setPrototypeOf(this, new.target.prototype);
+  /**
+   * Remove a previously registered listener.
+   */
+  off<T = unknown>(
+    event: InvoiceEventType | "*",
+    handler: WebhookEventHandler<T>,
+  ): void {
+    this.listeners.get(event)?.delete(handler as WebhookEventHandler);
   }
-}
 
-/**
- * Error thrown when required webhook headers are missing.
- */
-export class MissingHeaderError extends WebhookValidationError {
-  constructor(public readonly headerName: string) {
-    super(`Missing required webhook header: ${headerName}`, { headerName });
-    this.name = "MissingHeaderError";
-    Object.setPrototypeOf(this, new.target.prototype);
+  /**
+   * Dispatch a validated payload to all matching listeners.
+   * Errors thrown by listeners are isolated so one failure does not
+   * prevent other listeners from running.
+   */
+  async emit<T = unknown>(payload: WebhookPayload<T>): Promise<void> {
+    const specific = this.listeners.get(payload.event);
+    const wildcard = this.listeners.get("*");
+
+    const handlers: WebhookEventHandler[] = [];
+    if (specific) {
+      handlers.push(...specific);
+    }
+    if (wildcard) {
+      handlers.push(...wildcard);
+    }
+
+    for (const handler of handlers) {
+      try {
+        await handler(payload);
+      } catch {
+        // Isolate listener errors; continue dispatching to remaining handlers.
+      }
+    }
   }
-}
 
-/**
- * Error thrown when webhook payload is invalid or malformed.
- */
-export class InvalidPayloadError extends WebhookValidationError {
-  constructor(message: string, context?: Record<string, unknown>) {
-    super(`Invalid webhook payload: ${message}`, context);
-    this.name = "InvalidPayloadError";
-    Object.setPrototypeOf(this, new.target.prototype);
+  /**
+   * Remove all listeners, optionally for a single event type.
+   */
+  removeAllListeners(event?: InvoiceEventType | "*"): void {
+    if (event) {
+      this.listeners.delete(event);
+    } else {
+      this.listeners.clear();
+    }
   }
 }
 
 // ============================================================================
-// Webhook Middleware Factory
+// Middleware Factory
 // ============================================================================
 
-const DEFAULT_OPTIONS: Required<WebhookOptions> = {
-  toleranceSeconds: 300, // 5 minutes
-  nonceWindowSize: 1000,
-  signatureHeader: "x-stellarsplit-signature",
-  timestampHeader: "x-stellarsplit-timestamp",
-  nonceHeader: "x-stellarsplit-nonce",
-};
+const DEFAULT_TOLERANCE_SECONDS = 300;
+const DEFAULT_NONCE_WINDOW_SIZE = 1000;
+const DEFAULT_SIGNATURE_HEADER = "x-stellarsplit-signature";
+const DEFAULT_TIMESTAMP_HEADER = "x-stellarsplit-timestamp";
+const DEFAULT_NONCE_HEADER = "x-stellarsplit-nonce";
 
 /**
- * Create a secure webhook middleware for Express/Next.js.
- * 
- * This middleware verifies incoming StellarSplit webhooks using:
- * 1. HMAC-SHA256 signature verification with constant-time comparison
- * 2. Timestamp validation to prevent old requests
- * 3. Nonce tracking with LRU cache to prevent replay attacks
- * 
- * @param secret - Shared secret key for HMAC verification
- * @param options - Configuration options
- * @returns Express-compatible middleware function
- * 
- * @example
- * ```typescript
- * import express from 'express';
- * import { createWebhookMiddleware } from '@stellar-split/sdk';
- * 
- * const app = express();
- * 
- * // Raw body parser for signature verification
- * app.use('/webhooks/stellarsplit', express.raw({ type: 'application/json' }));
- * 
- * // Webhook middleware with verification
- * app.post(
- *   '/webhooks/stellarsplit',
- *   createWebhookMiddleware(process.env.WEBHOOK_SECRET!, {
- *     toleranceSeconds: 300,
- *     nonceWindowSize: 1000,
- *   }),
- *   (req, res) => {
- *     const { event, data } = req.webhookPayload;
- *     
- *     switch (event) {
- *       case 'invoice.paid':
- *         console.log('Invoice paid:', data);
- *         break;
- *       case 'invoice.released':
- *         console.log('Invoice released:', data);
- *         break;
- *     }
- *     
- *     res.status(200).json({ received: true });
- *   }
- * );
- * ```
+ * Create an Express middleware that validates incoming webhook requests.
+ *
+ * The middleware:
+ * 1. Extracts the raw body, signature, timestamp, and nonce from the request.
+ * 2. Verifies the HMAC-SHA256 signature using constant-time comparison.
+ * 3. Rejects requests with timestamps outside the tolerance window.
+ * 4. Rejects replayed nonces using an LRU cache.
+ * 5. Attaches the parsed payload to `req.webhookPayload` and dispatches it
+ *    to any registered event handlers.
+ *
+ * @param secret - The shared webhook secret
+ * @param options - Optional configuration
+ * @param emitter - Optional event emitter for dispatching validated events
+ * @returns Express request handler
  */
 export function createWebhookMiddleware(
   secret: string,
-  options?: WebhookOptions,
+  options: WebhookOptions = {},
+  emitter?: WebhookEventEmitter,
 ): RequestHandler {
-  if (!secret || typeof secret !== "string" || secret.length === 0) {
-    throw new ValidationError("Webhook secret must be a non-empty string");
+  if (!secret) {
+    throw new ValidationError("Webhook secret is required");
   }
 
-  const config: Required<WebhookOptions> = {
-    ...DEFAULT_OPTIONS,
-    ...options,
-  };
+  const toleranceSeconds =
+    options.toleranceSeconds ?? DEFAULT_TOLERANCE_SECONDS;
+  const signatureHeader =
+    options.signatureHeader ?? DEFAULT_SIGNATURE_HEADER;
+  const timestampHeader =
+    options.timestampHeader ?? DEFAULT_TIMESTAMP_HEADER;
+  const nonceHeader = options.nonceHeader ?? DEFAULT_NONCE_HEADER;
+  const seenNonces = new LRUCache<string, true>(
+    options.nonceWindowSize ?? DEFAULT_NONCE_WINDOW_SIZE,
+  );
 
-  // Initialize LRU cache for nonce tracking
-  const nonceCache = new LRUCache<string, number>(config.nonceWindowSize);
-
-  // Return the middleware function
-  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  return async (req: Request, res: Response, next: NextFunction) => {
     try {
-      // ====================================================================
-      // Step 1: Extract and validate headers
-      // ====================================================================
-      const signature = req.headers[config.signatureHeader.toLowerCase()];
-      const timestampHeader = req.headers[config.timestampHeader.toLowerCase()];
-      const nonce = req.headers[config.nonceHeader.toLowerCase()];
+      const rawBody = extractRawBody(req);
+      const signature = getHeader(req, signatureHeader);
+      const timestampRaw = getHeader(req, timestampHeader);
+      const nonce = getHeader(req, nonceHeader);
 
-      if (!signature || typeof signature !== "string") {
-        throw new MissingHeaderError(config.signatureHeader);
-      }
-
-      if (!timestampHeader || typeof timestampHeader !== "string") {
-        throw new MissingHeaderError(config.timestampHeader);
-      }
-
-      if (!nonce || typeof nonce !== "string") {
-        throw new MissingHeaderError(config.nonceHeader);
-      }
-
-      // ====================================================================
-      // Step 2: Validate timestamp (prevent old requests)
-      // ====================================================================
-      const timestamp = Number.parseInt(timestampHeader, 10);
-      if (Number.isNaN(timestamp)) {
-        throw new InvalidPayloadError("Timestamp must be a valid integer");
-      }
-
-      const now = Math.floor(Date.now() / 1000);
-      const timeDiff = Math.abs(now - timestamp);
-
-      if (timeDiff > config.toleranceSeconds) {
-        throw new TimestampOutOfBoundsError(timestamp, config.toleranceSeconds);
-      }
-
-      // ====================================================================
-      // Step 3: Check nonce for replay attacks
-      // ====================================================================
-      if (nonceCache.has(nonce)) {
-        throw new ReplayAttackError(nonce);
-      }
-
-      // ====================================================================
-      // Step 4: Extract raw body for signature verification
-      // ====================================================================
-      let rawBody: string;
-
-      if (Buffer.isBuffer(req.body)) {
-        // Body is a Buffer (from express.raw())
-        rawBody = req.body.toString("utf8");
-      } else if (typeof req.body === "string") {
-        // Body is already a string
-        rawBody = req.body;
-      } else if (typeof req.body === "object" && req.body !== null) {
-        // Body has been parsed to object - need to re-stringify
-        // This is not ideal but can happen if middleware order is wrong
-        rawBody = JSON.stringify(req.body);
-      } else {
-        throw new InvalidPayloadError("Request body is missing or invalid");
-      }
-
-      // ====================================================================
-      // Step 5: Verify HMAC-SHA256 signature (constant-time)
-      // ====================================================================
-      const isValid = await verifySignature(rawBody, signature, secret);
-
-      if (!isValid) {
-        throw new InvalidSignatureError();
-      }
-
-      // ====================================================================
-      // Step 6: Parse and validate payload structure
-      // ====================================================================
-      let payload: WebhookPayload;
-
-      try {
-        payload = JSON.parse(rawBody) as WebhookPayload;
-      } catch (parseError) {
-        throw new InvalidPayloadError("Payload is not valid JSON", {
-          error: parseError instanceof Error ? parseError.message : String(parseError),
-        });
-      }
-
-      // Validate required fields
-      if (!payload.event || typeof payload.event !== "string") {
-        throw new InvalidPayloadError("Missing or invalid 'event' field");
-      }
-
-      if (typeof payload.timestamp !== "number") {
-        throw new InvalidPayloadError("Missing or invalid 'timestamp' field");
-      }
-
-      if (!payload.nonce || typeof payload.nonce !== "string") {
-        throw new InvalidPayloadError("Missing or invalid 'nonce' field");
-      }
-
-      if (!payload.data) {
-        throw new InvalidPayloadError("Missing 'data' field");
-      }
-
-      // Verify nonce matches header
-      if (payload.nonce !== nonce) {
-        throw new InvalidPayloadError("Nonce in payload does not match header");
-      }
-
-      // Verify timestamp matches header
-      if (payload.timestamp !== timestamp) {
-        throw new InvalidPayloadError("Timestamp in payload does not match header");
-      }
-
-      // ====================================================================
-      // Step 7: Mark nonce as seen (after all validation passes)
-      // ====================================================================
-      nonceCache.set(nonce, timestamp);
-
-      // ====================================================================
-      // Step 8: Attach validated payload to request
-      // ====================================================================
-      (req as WebhookRequest).webhookPayload = payload;
-      (req as WebhookRequest).rawWebhookBody = rawBody;
-
-      // All checks passed - proceed to next middleware/handler
-      next();
-    } catch (error) {
-      // Handle validation errors
-      if (error instanceof WebhookValidationError) {
-        res.status(400).json({
-          error: error.name,
-          message: error.message,
-          code: error.code,
-        });
+      if (!signature || !timestampRaw || !nonce) {
+        res.status(401).json({ error: "Missing webhook authentication headers" });
         return;
       }
 
-      // Handle unexpected errors
-      console.error("Webhook middleware error:", error);
-      res.status(500).json({
-        error: "InternalServerError",
-        message: "An unexpected error occurred while processing the webhook",
-      });
+      const timestamp = Number.parseInt(timestampRaw, 10);
+      if (Number.isNaN(timestamp)) {
+        res.status(401).json({ error: "Invalid webhook timestamp" });
+        return;
+      }
+
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (Math.abs(nowSeconds - timestamp) > toleranceSeconds) {
+        res.status(401).json({ error: "Webhook timestamp outside tolerance" });
+        return;
+      }
+
+      const valid = await verifySignature(secret, timestamp, rawBody, signature);
+      if (!valid) {
+        res.status(401).json({ error: "Invalid webhook signature" });
+        return;
+      }
+
+      if (seenNonces.has(nonce)) {
+        res.status(409).json({ error: "Webhook replay detected" });
+        return;
+      }
+      seenNonces.set(nonce, true);
+
+      let payload: WebhookPayload;
+      try {
+        payload = JSON.parse(rawBody) as WebhookPayload;
+      } catch {
+        res.status(400).json({ error: "Invalid webhook payload" });
+        return;
+      }
+
+      const webhookReq = req as WebhookRequest;
+      webhookReq.webhookPayload = payload;
+      webhookReq.rawWebhookBody = rawBody;
+
+      if (emitter) {
+        await emitter.emit(payload);
+      }
+
+      next();
+    } catch (error) {
+      next(error);
     }
   };
 }
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
 /**
- * Generate HMAC-SHA256 signature for a webhook payload.
- * Used by webhook senders to sign outgoing webhooks.
- * 
- * @param payload - The webhook payload object
- * @param secret - Shared secret key
- * @returns Hex-encoded HMAC signature
- * 
- * @example
- * ```typescript
- * const payload = {
- *   event: 'invoice.paid',
- *   timestamp: Math.floor(Date.now() / 1000),
- *   nonce: crypto.randomUUID(),
- *   data: { invoiceId: '123', amount: '1000' }
- * };
- * 
- * const signature = await generateWebhookSignature(payload, secret);
- * ```
+ * Extract the raw request body as a string.
+ * Supports bodies captured by `express.raw()` (Buffer) or pre-parsed strings.
  */
-export async function generateWebhookSignature(
-  payload: WebhookPayload,
-  secret: string,
-): Promise<string> {
-  const payloadString = JSON.stringify(payload);
-  const signatureBytes = await computeHmacSha256(secret, payloadString);
-  return bytesToHex(signatureBytes);
+function extractRawBody(req: Request): string {
+  const body = (req as Request & { rawBody?: unknown }).rawBody ?? req.body;
+
+  if (typeof body === "string") {
+    return body;
+  }
+
+  if (body instanceof Uint8Array) {
+    return new TextDecoder().decode(body);
+  }
+
+  if (body && typeof body === "object") {
+    return JSON.stringify(body);
+  }
+
+  return "";
 }
 
 /**
- * Manually verify a webhook signature without middleware.
- * Useful for testing or custom webhook handling.
- * 
- * @param payload - The webhook payload string or object
- * @param signature - Hex-encoded HMAC signature
- * @param secret - Shared secret key
- * @returns True if signature is valid
- * 
- * @example
- * ```typescript
- * const isValid = await verifyWebhookSignature(
- *   rawBody,
- *   req.headers['x-stellarsplit-signature'],
- *   process.env.WEBHOOK_SECRET
- * );
- * ```
+ * Read a header value from the request, normalizing to a single string.
  */
-export async function verifyWebhookSignature(
-  payload: string | WebhookPayload,
-  signature: string,
-  secret: string,
-): Promise<boolean> {
-  const payloadString =
-    typeof payload === "string" ? payload : JSON.stringify(payload);
-  return verifySignature(payloadString, signature, secret);
-}
-
-/**
- * Type guard to check if an event type is valid.
- */
-export function isValidEventType(event: string): event is InvoiceEventType {
-  const validEvents: InvoiceEventType[] = [
-    "invoice.created",
-    "invoice.paid",
-    "invoice.failed",
-    "invoice.released",
-    "invoice.refunded",
-    "invoice.cancelled",
-    "invoice.expired",
-  ];
-  return validEvents.includes(event as InvoiceEventType);
-}
-
-/**
- * Parse and validate a webhook payload with type checking.
- * 
- * @param rawPayload - Raw webhook payload string
- * @returns Parsed and validated webhook payload
- * @throws {InvalidPayloadError} If payload is invalid
- */
-export function parseWebhookPayload<T = unknown>(
-  rawPayload: string,
-): WebhookPayload<T> {
-  let parsed: unknown;
-
-  try {
-    parsed = JSON.parse(rawPayload);
-  } catch (error) {
-    throw new InvalidPayloadError("Payload is not valid JSON", {
-      error: error instanceof Error ? error.message : String(error),
-    });
+function getHeader(req: Request, name: string): string | undefined {
+  const value = req.headers[name.toLowerCase()];
+  if (Array.isArray(value)) {
+    return value[0];
   }
-
-  if (typeof parsed !== "object" || parsed === null) {
-    throw new InvalidPayloadError("Payload must be an object");
-  }
-
-  const payload = parsed as Record<string, unknown>;
-
-  if (!payload.event || typeof payload.event !== "string") {
-    throw new InvalidPayloadError("Missing or invalid 'event' field");
-  }
-
-  if (!isValidEventType(payload.event)) {
-    throw new InvalidPayloadError(`Unknown event type: ${payload.event}`);
-  }
-
-  if (typeof payload.timestamp !== "number") {
-    throw new InvalidPayloadError("Missing or invalid 'timestamp' field");
-  }
-
-  if (!payload.nonce || typeof payload.nonce !== "string") {
-    throw new InvalidPayloadError("Missing or invalid 'nonce' field");
-  }
-
-  if (!payload.data) {
-    throw new InvalidPayloadError("Missing 'data' field");
-  }
-
-  return {
-    event: payload.event as InvoiceEventType,
-    timestamp: payload.timestamp as number,
-    nonce: payload.nonce as string,
-    data: payload.data as T,
-  };
+  return value;
 }
