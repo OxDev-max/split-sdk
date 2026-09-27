@@ -76,3 +76,86 @@ export class InvoiceStateBroadcaster {
 export function createInvoiceStateBroadcaster(): InvoiceStateBroadcaster {
   return new InvoiceStateBroadcaster();
 }
+
+/**
+ * Lifecycle phase of a simulated transaction rollback.
+ */
+export type RollbackPhase = "start" | "success" | "failure";
+
+/**
+ * Event emitted during a transaction rollback simulation.
+ */
+export interface RollbackEvent {
+  /** The transaction identifier being rolled back. */
+  transactionId: string;
+  /** The lifecycle phase this event represents. */
+  phase: RollbackPhase;
+  /** Optional error when the rollback fails. */
+  error?: Error;
+}
+
+/**
+ * Handler invoked for each rollback lifecycle event.
+ */
+export type RollbackEventHandler = (event: RollbackEvent) => void;
+
+/**
+ * Simulates SDK transaction rollbacks, emitting lifecycle events for the
+ * start, success, and failure phases of each rollback.
+ */
+export class TransactionRollbackSimulator {
+  private handlers: Set<RollbackEventHandler> = new Set();
+
+  /**
+   * Register a handler for rollback lifecycle events.
+   *
+   * @param handler - The handler to invoke on each event
+   * @returns Unsubscribe function that removes only this handler
+   */
+  onRollback(handler: RollbackEventHandler): () => void {
+    this.handlers.add(handler);
+    return () => {
+      this.handlers.delete(handler);
+    };
+  }
+
+  /**
+   * Simulate rolling back a transaction. Emits a "start" event, then either a
+   * "success" event or a "failure" event depending on the outcome.
+   *
+   * @param transactionId - The transaction identifier to roll back
+   * @param shouldFail - When true, the rollback fails and emits a failure event
+   * @returns True when the rollback succeeded, false otherwise
+   */
+  simulateRollback(transactionId: string, shouldFail = false): boolean {
+    this.emit({ transactionId, phase: "start" });
+
+    if (shouldFail) {
+      const error = new Error(`Rollback failed for transaction ${transactionId}`);
+      this.emit({ transactionId, phase: "failure", error });
+      return false;
+    }
+
+    this.emit({ transactionId, phase: "success" });
+    return true;
+  }
+
+  private emit(event: RollbackEvent): void {
+    this.handlers.forEach((handler) => {
+      try {
+        handler(event);
+      } catch (error) {
+        console.error(`Error in rollback handler for ${event.transactionId}:`, error);
+      }
+    });
+  }
+}
+
+/**
+ * Creates a new TransactionRollbackSimulator instance.
+ *
+ * @returns A new TransactionRollbackSimulator instance
+ */
+export function createTransactionRollbackSimulator(): TransactionRollbackSimulator {
+  return new TransactionRollbackSimulator();
+}
