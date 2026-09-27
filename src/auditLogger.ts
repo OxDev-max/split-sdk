@@ -53,6 +53,44 @@ export interface AnalyticsExportOptions {
   onEvent?: (event: AnalyticsExportEvent) => void;
 }
 
+/**
+ * A single invoice notification subscription.
+ *
+ * Represents a consumer's interest in receiving notifications for a given
+ * invoice. Subscriptions are keyed by `invoiceId` and may be filtered by the
+ * notification `events` the subscriber cares about.
+ */
+export interface InvoiceNotificationSubscription {
+  /** Unique identifier for the subscription. */
+  id: string;
+  /** The invoice this subscription is bound to. */
+  invoiceId: string;
+  /** Callback invoked when a matching invoice notification is emitted. */
+  handler: (notification: InvoiceNotification) => void;
+  /** Optional subset of events to receive; when omitted, all events fire. */
+  events?: InvoiceNotificationEvent[];
+}
+
+/** Notification event types emitted for invoice lifecycle changes. */
+export type InvoiceNotificationEvent =
+  | "invoice_created"
+  | "invoice_paid"
+  | "invoice_settled"
+  | "invoice_expired"
+  | "invoice_cancelled";
+
+/** A notification payload delivered to matching invoice subscribers. */
+export interface InvoiceNotification {
+  /** The invoice the notification pertains to. */
+  invoiceId: string;
+  /** The lifecycle event that triggered the notification. */
+  event: InvoiceNotificationEvent;
+  /** Epoch ms at which the notification was emitted. */
+  timestamp: number;
+  /** Optional additional context for the notification. */
+  data?: Record<string, unknown>;
+}
+
 const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
 
 /** Detect if a string value looks like base64-encoded XDR. */
@@ -65,6 +103,10 @@ export class AuditLogger {
   private readonly sink: (entry: AuditEntry) => void;
   private readonly splitAuditTrails = new Map<string, SplitAuditEntry[]>();
   private readonly entries: AuditEntry[] = [];
+  private readonly invoiceSubscriptions = new Map<
+    string,
+    InvoiceNotificationSubscription[]
+  >();
 
   constructor(sink: (entry: AuditEntry) => void) {
     this.sink = sink;
@@ -84,6 +126,69 @@ export class AuditLogger {
           : v,
       ])
     );
+  }
+
+  /**
+   * Register a subscription for invoice notifications.
+   *
+   * @param subscription - The subscription to register.
+   * @returns An unsubscribe function that removes the subscription.
+   */
+  subscribeToInvoice(
+    subscription: InvoiceNotificationSubscription,
+  ): () => void {
+    const existing = this.invoiceSubscriptions.get(subscription.invoiceId) ?? [];
+    existing.push(subscription);
+    this.invoiceSubscriptions.set(subscription.invoiceId, existing);
+
+    return () => this.unsubscribeFromInvoice(subscription.id);
+  }
+
+  /**
+   * Remove a previously registered invoice notification subscription by id.
+   *
+   * @returns `true` when a subscription was removed, `false` otherwise.
+   */
+  unsubscribeFromInvoice(subscriptionId: string): boolean {
+    for (const [invoiceId, subs] of this.invoiceSubscriptions) {
+      const index = subs.findIndex((s) => s.id === subscriptionId);
+      if (index !== -1) {
+        subs.splice(index, 1);
+        if (subs.length === 0) {
+          this.invoiceSubscriptions.delete(invoiceId);
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Emit an invoice notification to all matching subscribers.
+   *
+   * Subscribers registered for the invoice receive the notification when they
+   * have no event filter or when their filter includes the emitted event.
+   * Handler errors are isolated so one failing subscriber cannot prevent
+   * delivery to the others.
+   *
+   * @param notification - The notification to deliver.
+   * @returns The number of subscribers the notification was delivered to.
+   */
+  emitInvoiceNotification(notification: InvoiceNotification): number {
+    const subs = this.invoiceSubscriptions.get(notification.invoiceId);
+    if (!subs || subs.length === 0) return 0;
+
+    let delivered = 0;
+    for (const sub of subs) {
+      if (sub.events && !sub.events.includes(notification.event)) continue;
+      try {
+        sub.handler(notification);
+        delivered += 1;
+      } catch {
+        // Isolate subscriber failures; never break notification delivery.
+      }
+    }
+    return delivered;
   }
 
   /**
@@ -243,9 +348,8 @@ export class AuditLogger {
 
       onEvent?.({ type: "export_complete", export: result });
       return result;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      onEvent?.({ type: "export_error", error });
+    } catch (error) {
+      onEvent?.({ type: "export_error", error: error as Error });
       throw error;
     }
   }

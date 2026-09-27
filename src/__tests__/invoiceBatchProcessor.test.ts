@@ -5,11 +5,16 @@
  *  1. A batch where one invoice throws continues processing remaining invoices.
  *  2. The result object includes `succeeded` and `failed` arrays with correct contents.
  *  3. A batch where all invoices fail returns an empty `succeeded` array.
+ *
+ * Additionally, tests for the invoice notification subscription manager (#917)
+ * verify that subscribers are notified on success/failure events and that
+ * unsubscribing stops further notifications.
  */
 
 import { describe, it, expect, vi } from "vitest";
 import { InvoiceBatchProcessor } from "../invoiceBatchProcessor.js";
 import type { InvoicePaymentSubmitter } from "../invoiceBatchProcessor.js";
+import { InvoiceNotificationSubscriptionManager } from "../invoiceNotificationSubscriptionManager.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -140,5 +145,82 @@ describe("InvoiceBatchProcessor – partial-failure handling", () => {
     expect(failed).toHaveLength(3);
     expect(failed.every((r) => r.status === "failed")).toBe(true);
     expect(failed.every((r) => r.error === "network error")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests – invoice notification subscription manager (#917)
+// ---------------------------------------------------------------------------
+
+describe("InvoiceNotificationSubscriptionManager", () => {
+  it("notifies subscribers when an invoice event is emitted", () => {
+    const manager = new InvoiceNotificationSubscriptionManager();
+    const listener = vi.fn();
+
+    manager.subscribe(listener);
+    manager.emit({ type: "invoice.paid", invoiceId: "inv1", txHash: "tx-inv1" });
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledWith({
+      type: "invoice.paid",
+      invoiceId: "inv1",
+      txHash: "tx-inv1",
+    });
+  });
+
+  it("supports multiple subscribers and notifies all of them", () => {
+    const manager = new InvoiceNotificationSubscriptionManager();
+    const first = vi.fn();
+    const second = vi.fn();
+
+    manager.subscribe(first);
+    manager.subscribe(second);
+    manager.emit({ type: "invoice.failed", invoiceId: "inv2", error: "boom" });
+
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(first).toHaveBeenCalledWith({
+      type: "invoice.failed",
+      invoiceId: "inv2",
+      error: "boom",
+    });
+  });
+
+  it("stops notifying a subscriber after unsubscribe", () => {
+    const manager = new InvoiceNotificationSubscriptionManager();
+    const listener = vi.fn();
+
+    const unsubscribe = manager.subscribe(listener);
+    manager.emit({ type: "invoice.paid", invoiceId: "inv1", txHash: "tx-inv1" });
+    unsubscribe();
+    manager.emit({ type: "invoice.paid", invoiceId: "inv1", txHash: "tx-inv1" });
+
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("isolates subscriber errors so other subscribers still receive events", () => {
+    const manager = new InvoiceNotificationSubscriptionManager();
+    const failing = vi.fn(() => {
+      throw new Error("subscriber exploded");
+    });
+    const healthy = vi.fn();
+
+    manager.subscribe(failing);
+    manager.subscribe(healthy);
+
+    expect(() =>
+      manager.emit({ type: "invoice.paid", invoiceId: "inv1", txHash: "tx-inv1" }),
+    ).not.toThrow();
+    expect(healthy).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports the number of active subscribers", () => {
+    const manager = new InvoiceNotificationSubscriptionManager();
+    const unsubscribeA = manager.subscribe(vi.fn());
+    manager.subscribe(vi.fn());
+
+    expect(manager.subscriberCount).toBe(2);
+    unsubscribeA();
+    expect(manager.subscriberCount).toBe(1);
   });
 });
