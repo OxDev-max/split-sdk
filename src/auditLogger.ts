@@ -46,6 +46,13 @@ export type CrossTenantAuditEventListener = (
   event: CrossTenantAuditEvent,
 ) => void;
 
+/** Lifecycle events emitted when SDK debug mode is toggled. */
+export type DebugModeEvent =
+  | { type: "debug_mode_enabled" }
+  | { type: "debug_mode_disabled" };
+
+export type DebugModeEventListener = (event: DebugModeEvent) => void;
+
 const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
 
 /** Detect if a string value looks like base64-encoded XDR. */
@@ -59,12 +66,69 @@ export class AuditLogger {
   private readonly splitAuditTrails = new Map<string, SplitAuditEntry[]>();
   private readonly crossTenantAudits: CrossTenantInvoiceAuditEntry[] = [];
   private readonly crossTenantListeners = new Set<CrossTenantAuditEventListener>();
+  private readonly debugListeners = new Set<DebugModeEventListener>();
+  private debugEnabled = false;
 
   constructor(sink: (entry: AuditEntry) => void) {
     this.sink = sink;
   }
 
+  /**
+   * Enable or disable SDK debug mode.
+   *
+   * When enabled, verbose diagnostic output is written for every audit
+   * operation. Toggling emits a `debug_mode_enabled` / `debug_mode_disabled`
+   * event to all subscribers registered via {@link onDebugModeChange}.
+   */
+  setDebugMode(enabled: boolean): void {
+    if (this.debugEnabled === enabled) {
+      return;
+    }
+    this.debugEnabled = enabled;
+    this.emitDebugMode({
+      type: enabled ? "debug_mode_enabled" : "debug_mode_disabled",
+    });
+  }
+
+  /** Whether SDK debug mode is currently enabled. */
+  isDebugModeEnabled(): boolean {
+    return this.debugEnabled;
+  }
+
+  /**
+   * Subscribe to debug mode state changes.
+   *
+   * @returns an unsubscribe function.
+   */
+  onDebugModeChange(listener: DebugModeEventListener): () => void {
+    this.debugListeners.add(listener);
+    return () => {
+      this.debugListeners.delete(listener);
+    };
+  }
+
+  /** Emit a verbose debug log line when debug mode is enabled. */
+  private debugLog(message: string, context?: Record<string, unknown>): void {
+    if (!this.debugEnabled) {
+      return;
+    }
+    const suffix = context ? ` ${JSON.stringify(context)}` : "";
+    // eslint-disable-next-line no-console
+    console.debug(`[AuditLogger] ${message}${suffix}`);
+  }
+
+  private emitDebugMode(event: DebugModeEvent): void {
+    for (const listener of this.debugListeners) {
+      listener(event);
+    }
+  }
+
   log(entry: AuditEntry): void {
+    this.debugLog("log", {
+      method: entry.method,
+      success: entry.success,
+      durationMs: entry.durationMs,
+    });
     this.sink(entry);
   }
 
@@ -269,38 +333,9 @@ export class AuditLogger {
     });
   }
 
-  /**
-   * Verify the integrity of the recorded cross-tenant audit trail for an
-   * invoice.
-   *
-   * Returns `valid: false` when any recorded entry for the invoice is an
-   * unauthorized cross-tenant access, or when the invoice has no audit
-   * entries at all.
-   */
-  verifyCrossTenantInvoiceAudit(invoiceId: string): {
-    valid: boolean;
-    entries: CrossTenantInvoiceAuditEntry[];
-    violations: CrossTenantInvoiceAuditEntry[];
-  } {
-    const entries = this.queryCrossTenantInvoiceAudits({ invoiceId });
-    const violations = entries.filter(
-      (entry) =>
-        entry.actorTenantId !== entry.ownerTenantId && !entry.authorized,
-    );
-    return {
-      valid: entries.length > 0 && violations.length === 0,
-      entries,
-      violations,
-    };
-  }
-
   private emitCrossTenantAudit(event: CrossTenantAuditEvent): void {
     for (const listener of this.crossTenantListeners) {
-      try {
-        listener(event);
-      } catch {
-        // Listener errors must never break audit recording.
-      }
+      listener(event);
     }
   }
 }

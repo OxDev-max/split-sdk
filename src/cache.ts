@@ -18,6 +18,74 @@ export interface MethodCacheEntry {
   expiresAt: number;
 }
 
+/**
+ * SDK debug mode configuration.
+ *
+ * When enabled, cache operations emit verbose log lines through the
+ * configured logger so integrators can trace cache hits, misses, writes,
+ * evictions and invalidations.
+ */
+export interface DebugModeOptions {
+  enabled?: boolean;
+  logger?: (message: string, ...args: any[]) => void;
+}
+
+/**
+ * Shared debug-mode state used by the cache implementations.
+ *
+ * Emits `debug:change` events whenever the enabled flag flips so consumers
+ * can react to debug mode being toggled at runtime.
+ */
+export class DebugMode {
+  private enabled: boolean;
+  private readonly logger: (message: string, ...args: any[]) => void;
+  private readonly listeners = new Set<(enabled: boolean) => void>();
+
+  constructor(options?: DebugModeOptions) {
+    this.enabled = options?.enabled ?? false;
+    this.logger = options?.logger ?? ((message: string, ...args: any[]) => console.debug(message, ...args));
+  }
+
+  /** Whether verbose logging is currently active. */
+  get isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  /** Enable or disable debug mode, emitting a change event on transitions. */
+  setEnabled(enabled: boolean): void {
+    if (this.enabled === enabled) return;
+    this.enabled = enabled;
+    for (const listener of this.listeners) {
+      listener(enabled);
+    }
+  }
+
+  enable(): void {
+    this.setEnabled(true);
+  }
+
+  disable(): void {
+    this.setEnabled(false);
+  }
+
+  /**
+   * Register a listener invoked with the new state whenever debug mode
+   * changes. Returns an unsubscribe function.
+   */
+  onChange(listener: (enabled: boolean) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** Emit a verbose log line when debug mode is enabled. */
+  log(message: string, ...args: any[]): void {
+    if (!this.enabled) return;
+    this.logger(message, ...args);
+  }
+}
+
 export class SimpleCache<T> {
   private readonly store = new Map<string, MethodCacheEntry>();
   private readonly ttlConfig: Record<string, number>;
@@ -26,8 +94,9 @@ export class SimpleCache<T> {
   private misses = 0;
   private evictions = 0;
   private maxEntries: number;
+  private readonly debug: DebugMode;
 
-  constructor(config?: number | { enabled?: boolean; ttl?: Record<string, number>; ttlMs?: number; maxEntries?: number }) {
+  constructor(config?: number | { enabled?: boolean; ttl?: Record<string, number>; ttlMs?: number; maxEntries?: number; debug?: boolean | DebugModeOptions }) {
     if (typeof config === "number") {
       this.enabled = true;
       this.maxEntries = 1000;
@@ -40,6 +109,18 @@ export class SimpleCache<T> {
         this.ttlConfig["default"] = config.ttlMs;
       }
     }
+    this.debug = new DebugMode(
+      typeof config === "object" && config?.debug !== undefined
+        ? typeof config.debug === "boolean"
+          ? { enabled: config.debug }
+          : config.debug
+        : undefined
+    );
+  }
+
+  /** Access the debug-mode controller for this cache instance. */
+  getDebugMode(): DebugMode {
+    return this.debug;
   }
 
   get(key: string): T | undefined {
@@ -47,11 +128,13 @@ export class SimpleCache<T> {
     const entry = this.store.get(key);
     if (!entry) {
       this.misses++;
+      this.debug.log(`[cache] miss ${key}`);
       return undefined;
     }
     if (Date.now() > entry.expiresAt) {
       this.store.delete(key);
       this.misses++;
+      this.debug.log(`[cache] expired ${key}`);
       return undefined;
     }
     
@@ -60,6 +143,7 @@ export class SimpleCache<T> {
     this.store.set(key, entry);
 
     this.hits++;
+    this.debug.log(`[cache] hit ${key}`);
     return entry.value;
   }
 
@@ -74,20 +158,24 @@ export class SimpleCache<T> {
       if (oldestKey !== undefined) {
         this.store.delete(oldestKey);
         this.evictions++;
+        this.debug.log(`[cache] evict ${oldestKey}`);
       }
     }
 
     this.store.set(key, { value, expiresAt: Date.now() + ttl });
+    this.debug.log(`[cache] set ${key} (ttl=${ttl}ms)`);
   }
 
   invalidate(methodOrKey?: string, args?: any[]): void {
     if (!methodOrKey) {
       this.store.clear();
+      this.debug.log("[cache] invalidate all");
       return;
     }
     if (args) {
       const key = `${methodOrKey}:${JSON.stringify(args)}`;
       this.store.delete(key);
+      this.debug.log(`[cache] invalidate ${key}`);
       return;
     }
     
@@ -103,10 +191,12 @@ export class SimpleCache<T> {
         this.store.delete(key);
       }
     }
+    this.debug.log(`[cache] invalidate ${methodOrKey}`);
   }
 
   clear(): void {
     this.store.clear();
+    this.debug.log("[cache] clear");
   }
 
   getStats(): CacheStats {
@@ -163,13 +253,23 @@ interface CacheEntry<V> {
 export class Cache<V> {
   private readonly store = new Map<string, CacheEntry<V>>();
   private readonly ttlMs: number | undefined;
+  private readonly debug: DebugMode;
 
   /**
    * @param ttlMs  Time-to-live in milliseconds.  Omit (or pass `undefined`)
    *               for no-expiry behaviour.
+   * @param debug  Optional debug-mode configuration for verbose logging.
    */
-  constructor(ttlMs?: number) {
+  constructor(ttlMs?: number, debug?: boolean | DebugModeOptions) {
     this.ttlMs = ttlMs;
+    this.debug = new DebugMode(
+      typeof debug === "boolean" ? { enabled: debug } : debug
+    );
+  }
+
+  /** Access the debug-mode controller for this cache instance. */
+  getDebugMode(): DebugMode {
+    return this.debug;
   }
 
   /**
@@ -177,6 +277,7 @@ export class Cache<V> {
    */
   set(key: string, value: V): void {
     this.store.set(key, { value, writtenAt: Date.now() });
+    this.debug.log(`[cache] set ${key}`);
   }
 
   /**
@@ -188,11 +289,16 @@ export class Cache<V> {
    */
   get(key: string): V | undefined {
     const entry = this.store.get(key);
-    if (!entry) return undefined;
-    if (this.isExpired(entry)) {
-      this.store.delete(key);
+    if (!entry) {
+      this.debug.log(`[cache] miss ${key}`);
       return undefined;
     }
+    if (this.isExpired(entry)) {
+      this.store.delete(key);
+      this.debug.log(`[cache] expired ${key}`);
+      return undefined;
+    }
+    this.debug.log(`[cache] hit ${key}`);
     return entry.value;
   }
 
@@ -226,11 +332,13 @@ export class Cache<V> {
   /** Remove a specific entry by key. */
   delete(key: string): void {
     this.store.delete(key);
+    this.debug.log(`[cache] delete ${key}`);
   }
 
   /** Remove all entries. */
   clear(): void {
     this.store.clear();
+    this.debug.log("[cache] clear");
   }
 
   /** Number of entries currently in the store (including not-yet-evicted expired ones). */
