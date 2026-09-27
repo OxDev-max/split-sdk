@@ -281,4 +281,59 @@ client.setTelemetryHooks({
 console.log("\nEven if hooks throw exceptions, SDK operations continue normally.");
 console.log("Hook exceptions are logged to console but don't propagate to your code.");
 
+// Example 8: Built-in SDK performance profiling
+console.log("\n=== Example 8: Built-in Performance Profiling ===");
+
+// The SDK ships with a built-in profiler that records operation timings
+// and emits lifecycle events (start/stop/mark/measure) without any extra setup.
+client.startProfiling();
+
+// Subscribe to profiling lifecycle events
+const unsubscribeProfiling = client.onProfilingEvent((event) => {
+  switch (event.type) {
+    case "start":
+      console.log(`🟢 Profiling started at ${new Date(event.timestamp).toISOString()}`);
+      break;
+    case "mark":
+      console.log(`📍 Mark "${event.name}" at ${event.timestamp}`);
+      break;
+    case "measure":
+      console.log(`⏱️  Measure "${event.name}": ${event.durationMs}ms`);
+      break;
+    case "stop":
+      console.log(`🔴 Profiling stopped at ${new Date(event.timestamp).toISOString()}`);
+      break;
+  }
+});
+
+async function demonstrateProfiling() {
+  console.log("\n=== Running Profiled SDK Operations ===\n");
+
+  client.mark("before-getInvoice");
+  try {
+    await client.getInvoice("789");
+  } catch (error) {
+    console.log("Expected error caught in main code");
+  }
+  client.mark("after-getInvoice");
+  client.measure("getInvoice-roundtrip", "before-getInvoice", "after-getInvoice");
+
+  // Retrieve aggregated profiling metrics
+  const metrics = client.getProfilingMetrics();
+  console.log("\n📊 Built-in Profiling Metrics:");
+  for (const [name, stats] of Object.entries(metrics)) {
+    console.log(`  ${name}:`);
+    console.log(`    Calls: ${stats.calls}`);
+    console.log(`    Avg: ${stats.avgMs.toFixed(2)}ms`);
+    console.log(`    Min: ${stats.minMs}ms, Max: ${stats.maxMs}ms`);
+  }
+
+  // Stop profiling and clean up the event subscription
+  client.stopProfiling();
+  unsubscribeProfiling();
+  console.log("✅ Profiling stopped and listener removed");
+}
+
+demonstrateProfiling().catch(console.error);
+
 export { client, perfMonitor, errorTracker, analytics };
