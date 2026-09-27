@@ -25,12 +25,38 @@ export const DEFAULT_CIRCUIT_BREAKER_CONFIG: CircuitBreakerConfig = {
 
 export type CircuitBreakerState = "closed" | "open" | "half-open";
 
+/** Overall health status reported by the SDK health check. */
+export type HealthStatus = "healthy" | "degraded" | "unhealthy";
+
+/** Detailed diagnostics produced by {@link CircuitBreaker.healthCheck}. */
+export interface HealthCheckDiagnostics {
+  /** Aggregate health derived from the circuit state and failure count. */
+  status: HealthStatus;
+  /** Current circuit breaker state. */
+  state: CircuitBreakerState;
+  /** Number of consecutive failures recorded. */
+  failureCount: number;
+  /** Configured failure threshold. */
+  failureThreshold: number;
+  /** Configured reset timeout in milliseconds. */
+  resetTimeoutMs: number;
+  /** Timestamp of the last failure, or null if none recorded. */
+  lastFailureTime: number | null;
+  /** Milliseconds since the last failure, or null if none recorded. */
+  msSinceLastFailure: number | null;
+  /** Milliseconds remaining until the circuit may probe recovery, or null. */
+  msUntilReset: number | null;
+  /** Human-readable summary of the current health. */
+  message: string;
+}
+
 /** Event map for typed circuit breaker events. */
 export interface CircuitBreakerEventMap {
   "circuit:open": [];
   "circuit:close": [];
   "circuit:half-open": [];
   stateChange: [{ from: CircuitBreakerState; to: CircuitBreakerState }];
+  "health:check": [HealthCheckDiagnostics];
 }
 
 /**
@@ -130,6 +156,57 @@ export class CircuitBreaker extends EventEmitter {
     }
 
     return false;
+  }
+
+  /**
+   * Perform a health check and return detailed diagnostics about the
+   * circuit breaker's current condition. Emits a `health:check` event
+   * with the produced diagnostics.
+   */
+  healthCheck(): HealthCheckDiagnostics {
+    const now = Date.now();
+    const msSinceLastFailure =
+      this._lastFailureTime === null ? null : now - this._lastFailureTime;
+
+    let msUntilReset: number | null = null;
+    if (this._state === "open" && this._lastFailureTime !== null) {
+      msUntilReset = Math.max(
+        0,
+        this._config.resetTimeoutMs - (now - this._lastFailureTime),
+      );
+    }
+
+    let status: HealthStatus;
+    let message: string;
+
+    if (this._state === "closed") {
+      status = "healthy";
+      message = "Circuit is closed; requests are flowing normally.";
+    } else if (this._state === "half-open") {
+      status = "degraded";
+      message = "Circuit is half-open; probing recovery with a single request.";
+    } else {
+      status = "unhealthy";
+      message =
+        msUntilReset !== null && msUntilReset > 0
+          ? `Circuit is open; retry in ${msUntilReset}ms.`
+          : "Circuit is open; cooldown elapsed, ready to probe recovery.";
+    }
+
+    const diagnostics: HealthCheckDiagnostics = {
+      status,
+      state: this._state,
+      failureCount: this._failureCount,
+      failureThreshold: this._config.failureThreshold,
+      resetTimeoutMs: this._config.resetTimeoutMs,
+      lastFailureTime: this._lastFailureTime,
+      msSinceLastFailure,
+      msUntilReset,
+      message,
+    };
+
+    this.emit("health:check", diagnostics);
+    return diagnostics;
   }
 
   /**
