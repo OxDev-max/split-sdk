@@ -2141,6 +2141,53 @@ export class StellarTomlFetchError extends StellarSplitError {
   }
 }
 
+/**
+ * Thrown when a TLS certificate fingerprint for an anchor HTTPS endpoint does
+ * not match the configured pinned fingerprint (#780).
+ *
+ * The fingerprint should be a colon-separated uppercase hex string in the
+ * standard `openssl` format, e.g. `"AA:BB:CC:..."`.
+ */
+export class CertificatePinningError extends StellarSplitError {
+  readonly domain: string;
+  readonly expectedFingerprint: string;
+  readonly actualFingerprint: string;
+
+  constructor(domain: string, expectedFingerprint: string, actualFingerprint: string) {
+    super(
+      `Certificate fingerprint mismatch for domain "${domain}": ` +
+        `expected "${expectedFingerprint}", got "${actualFingerprint}"`,
+      "CERTIFICATE_PINNING_ERROR",
+      { domain, expectedFingerprint, actualFingerprint },
+    );
+    this.name = "CertificatePinningError";
+    this.domain = domain;
+    this.expectedFingerprint = expectedFingerprint;
+    this.actualFingerprint = actualFingerprint;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * Thrown when a `stellar.toml` file carries a VERSION that is not listed in
+ * {@link SUPPORTED_TOML_VERSIONS} (#779).
+ */
+export class UnsupportedTomlVersionError extends StellarSplitError {
+  readonly encounteredVersion: string;
+
+  constructor(encounteredVersion: string) {
+    super(
+      `Unsupported stellar.toml VERSION "${encounteredVersion}". ` +
+        `Supported versions: ${JSON.stringify([2.0, 2.1])}`,
+      "UNSUPPORTED_TOML_VERSION",
+      { encounteredVersion },
+    );
+    this.name = "UnsupportedTomlVersionError";
+    this.encounteredVersion = encounteredVersion;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 /** Thrown when all channel accounts in the pool are busy and the acquire timeout elapses. */
 export class ChannelExhaustedError extends StellarSplitError {
   readonly poolSize: number;

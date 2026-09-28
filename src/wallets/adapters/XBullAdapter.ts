@@ -90,6 +90,15 @@ export class XBullAdapter implements WalletAdapter {
   private setupAccountChangeListener(): void {
     if (!window.xbull) return;
 
+    // Drop the previous registration before installing a new one so that
+    // repeated connect() calls (e.g. reconnect after a dropped session or a
+    // component remount) never leave more than one live listener registered
+    // with the wallet.  Mirrors the approach used by LobstrAdapter.
+    if (this.unsubscribe) {
+      this.unsubscribe();
+      this.unsubscribe = null;
+    }
+
     this.unsubscribe = window.xbull.onAccountChange((publicKey: string) => {
       this.currentPublicKey = publicKey;
       
