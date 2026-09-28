@@ -56,6 +56,50 @@ export interface TelemetryCallEndParams {
 }
 
 /**
+ * A single recorded performance measurement produced by the built-in profiler.
+ */
+export interface ProfileMeasurement {
+  /** The SDK method or operation name that was measured. */
+  name: string;
+  /** Duration of the operation in milliseconds. */
+  durationMs: number;
+  /** Timestamp when the measurement was recorded (milliseconds since epoch). */
+  timestamp: number;
+  /** Optional trace ID correlating this measurement with an SDK call. */
+  traceId?: string;
+  /** Optional arbitrary metadata attached to the measurement. */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Aggregated statistics for a profiled operation name.
+ */
+export interface ProfileStats {
+  /** The operation name these stats describe. */
+  name: string;
+  /** Number of recorded measurements. */
+  count: number;
+  /** Total accumulated duration in milliseconds. */
+  totalMs: number;
+  /** Minimum observed duration in milliseconds. */
+  minMs: number;
+  /** Maximum observed duration in milliseconds. */
+  maxMs: number;
+  /** Mean duration in milliseconds. */
+  avgMs: number;
+}
+
+/**
+ * Parameters passed to the onProfile hook when a measurement is recorded.
+ */
+export interface TelemetryProfileParams {
+  /** The recorded measurement. */
+  measurement: ProfileMeasurement;
+  /** Aggregated stats for the measured operation name. */
+  stats: ProfileStats;
+}
+
+/**
  * Telemetry hooks that can be registered with the SDK.
  * All hooks are optional and fire-and-forget.
  */
@@ -81,6 +125,13 @@ export interface TelemetryHooks {
    * @param params - Call results including method name, duration, success status, and optional error.
    */
   onCallEnd?(params: TelemetryCallEndParams): void;
+
+  /**
+   * Called whenever the built-in profiler records a measurement.
+   * 
+   * @param params - The measurement and its aggregated stats.
+   */
+  onProfile?(params: TelemetryProfileParams): void;
 }
 
 /**
@@ -166,9 +217,227 @@ export class TelemetryHookManager {
   }
 
   /**
+   * Invoke the onProfile hook if registered.
+   * Exceptions within the hook are caught and logged but do not propagate.
+   * 
+   * @param params - Profile measurement and stats.
+   */
+  fireOnProfile(params: TelemetryProfileParams): void {
+    if (!this.hooks.onProfile) {
+      return;
+    }
+
+    try {
+      this.hooks.onProfile(params);
+    } catch (hookError) {
+      // Fire-and-forget: hook errors must not propagate
+      console.error("[TelemetryHook] onProfile hook threw an exception:", hookError);
+    }
+  }
+
+  /**
    * Check if any hooks are registered.
    */
   hasHooks(): boolean {
-    return !!(this.hooks.onError || this.hooks.onCallStart || this.hooks.onCallEnd);
+    return !!(
+      this.hooks.onError ||
+      this.hooks.onCallStart ||
+      this.hooks.onCallEnd ||
+      this.hooks.onProfile
+    );
+  }
+}
+
+/**
+ * Built-in SDK performance profiler.
+ *
+ * Records operation timings, aggregates per-operation statistics, and emits
+ * lifecycle events (start/stop/mark/measure) through the telemetry hook manager.
+ *
+ * The profiler is disabled by default and must be explicitly enabled via
+ * {@link enable} so it adds zero overhead unless opted into.
+ */
+export class SdkProfiler {
+  private enabled = false;
+  private readonly measurements: ProfileMeasurement[] = [];
+  private readonly stats = new Map<string, ProfileStats>();
+  private readonly activeMarks = new Map<string, number>();
+
+  constructor(private readonly hookManager?: TelemetryHookManager) {}
+
+  /**
+   * Enable profiling. Subsequent {@link measure} and {@link mark}/{@link endMark}
+   * calls will record measurements.
+   */
+  enable(): void {
+    this.enabled = true;
+  }
+
+  /**
+   * Disable profiling. Existing recorded measurements are retained until cleared.
+   */
+  disable(): void {
+    this.enabled = false;
+  }
+
+  /**
+   * Whether profiling is currently enabled.
+   */
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  /**
+   * Record a completed measurement for the given operation name.
+   * No-op when profiling is disabled.
+   *
+   * @param name - The operation name being measured.
+   * @param durationMs - Duration of the operation in milliseconds.
+   * @param options - Optional trace ID and metadata.
+   * @returns The recorded measurement, or undefined when disabled.
+   */
+  measure(
+    name: string,
+    durationMs: number,
+    options?: { traceId?: string; metadata?: Record<string, unknown> }
+  ): ProfileMeasurement | undefined {
+    if (!this.enabled) {
+      return undefined;
+    }
+
+    const measurement: ProfileMeasurement = {
+      name,
+      durationMs,
+      timestamp: Date.now(),
+      traceId: options?.traceId,
+      metadata: options?.metadata,
+    };
+
+    this.measurements.push(measurement);
+    const stats = this.updateStats(measurement);
+    this.hookManager?.fireOnProfile({ measurement, stats });
+
+    return measurement;
+  }
+
+  /**
+   * Start timing an operation. Pairs with {@link endMark}.
+   * No-op when profiling is disabled.
+   *
+   * @param name - The operation name to start timing.
+   */
+  mark(name: string): void {
+    if (!this.enabled) {
+      return;
+    }
+    this.activeMarks.set(name, Date.now());
+  }
+
+  /**
+   * Finish timing an operation started with {@link mark} and record the measurement.
+   * No-op when profiling is disabled or no matching mark exists.
+   *
+   * @param name - The operation name to finish timing.
+   * @param options - Optional trace ID and metadata.
+   * @returns The recorded measurement, or undefined when disabled/unmatched.
+   */
+  endMark(
+    name: string,
+    options?: { traceId?: string; metadata?: Record<string, unknown> }
+  ): ProfileMeasurement | undefined {
+    if (!this.enabled) {
+      return undefined;
+    }
+
+    const start = this.activeMarks.get(name);
+    if (start === undefined) {
+      return undefined;
+    }
+
+    this.activeMarks.delete(name);
+    return this.measure(name, Date.now() - start, options);
+  }
+
+  /**
+   * Convenience helper that times an async operation and records a measurement.
+   * No-op passthrough when profiling is disabled.
+   *
+   * @param name - The operation name being measured.
+   * @param fn - The async function to execute and time.
+   * @param options - Optional trace ID and metadata.
+   * @returns The resolved value of the wrapped function.
+   */
+  async profile<T>(
+    name: string,
+    fn: () => Promise<T>,
+    options?: { traceId?: string; metadata?: Record<string, unknown> }
+  ): Promise<T> {
+    if (!this.enabled) {
+      return fn();
+    }
+
+    const start = Date.now();
+    try {
+      return await fn();
+    } finally {
+      this.measure(name, Date.now() - start, options);
+    }
+  }
+
+  /**
+   * Get all recorded measurements (a defensive copy).
+   */
+  getMeasurements(): ProfileMeasurement[] {
+    return [...this.measurements];
+  }
+
+  /**
+   * Get aggregated stats for a single operation name, if any.
+   */
+  getStats(name: string): ProfileStats | undefined {
+    const stats = this.stats.get(name);
+    return stats ? { ...stats } : undefined;
+  }
+
+  /**
+   * Get aggregated stats for all profiled operation names.
+   */
+  getAllStats(): ProfileStats[] {
+    return Array.from(this.stats.values(), (stats) => ({ ...stats }));
+  }
+
+  /**
+   * Clear all recorded measurements, stats, and active marks.
+   */
+  clear(): void {
+    this.measurements.length = 0;
+    this.stats.clear();
+    this.activeMarks.clear();
+  }
+
+  private updateStats(measurement: ProfileMeasurement): ProfileStats {
+    const existing = this.stats.get(measurement.name);
+
+    const next: ProfileStats = existing
+      ? {
+          name: measurement.name,
+          count: existing.count + 1,
+          totalMs: existing.totalMs + measurement.durationMs,
+          minMs: Math.min(existing.minMs, measurement.durationMs),
+          maxMs: Math.max(existing.maxMs, measurement.durationMs),
+          avgMs: 0,
+        }
+      : {
+          name: measurement.name,
+          count: 1,
+          totalMs: measurement.durationMs,
+          minMs: measurement.durationMs,
+          maxMs: measurement.durationMs,
+          avgMs: 0,
+        };
+
+    next.avgMs = next.totalMs / next.count;
+    this.stats.set(measurement.name, next);
+    return next;
   }
 }

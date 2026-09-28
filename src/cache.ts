@@ -38,7 +38,7 @@ export class SimpleCache<T> {
   private maxEntries: number;
   private readonly listeners = new Set<CacheEventListener>();
 
-  constructor(config?: number | { enabled?: boolean; ttl?: Record<string, number>; ttlMs?: number; maxEntries?: number }) {
+  constructor(config?: number | { enabled?: boolean; ttl?: Record<string, number>; ttlMs?: number; maxEntries?: number; debug?: boolean | DebugModeOptions }) {
     if (typeof config === "number") {
       this.enabled = true;
       this.maxEntries = 1000;
@@ -51,6 +51,18 @@ export class SimpleCache<T> {
         this.ttlConfig["default"] = config.ttlMs;
       }
     }
+    this.debug = new DebugMode(
+      typeof config === "object" && config?.debug !== undefined
+        ? typeof config.debug === "boolean"
+          ? { enabled: config.debug }
+          : config.debug
+        : undefined
+    );
+  }
+
+  /** Access the debug-mode controller for this cache instance. */
+  getDebugMode(): DebugMode {
+    return this.debug;
   }
 
   /**
@@ -147,10 +159,12 @@ export class SimpleCache<T> {
         this.emit("invalidate", key);
       }
     }
+    this.debug.log(`[cache] invalidate ${methodOrKey}`);
   }
 
   clear(): void {
     this.store.clear();
+    this.debug.log("[cache] clear");
   }
 
   getStats(): CacheStats {
@@ -213,9 +227,18 @@ export class Cache<V> {
   /**
    * @param ttlMs  Time-to-live in milliseconds.  Omit (or pass `undefined`)
    *               for no-expiry behaviour.
+   * @param debug  Optional debug-mode configuration for verbose logging.
    */
-  constructor(ttlMs?: number) {
+  constructor(ttlMs?: number, debug?: boolean | DebugModeOptions) {
     this.ttlMs = ttlMs;
+    this.debug = new DebugMode(
+      typeof debug === "boolean" ? { enabled: debug } : debug
+    );
+  }
+
+  /** Access the debug-mode controller for this cache instance. */
+  getDebugMode(): DebugMode {
+    return this.debug;
   }
 
   /**

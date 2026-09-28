@@ -70,6 +70,106 @@ export class AuditTrailHasher {
   }
 
   /**
+   * Records an invoice audit entry scoped to a tenant, enabling cross-tenant auditing.
+   * Emits an 'invoice.audited' lifecycle event.
+   */
+  async auditInvoice(tenantId: string, invoiceId: string, event: AuditEvent): Promise<CrossTenantAuditRecord> {
+    const entry = await this.append(event);
+    const record: CrossTenantAuditRecord = {
+      tenantId,
+      invoiceId,
+      event,
+      entry,
+      recordedAt: Date.now(),
+    };
+    this.crossTenantRecords.push(record);
+    this.emit({
+      type: 'invoice.audited',
+      tenantId,
+      invoiceId,
+      entry,
+      timestamp: record.recordedAt,
+    });
+    return record;
+  }
+
+  /**
+   * Records a cross-tenant access attempt against an invoice and emits a
+   * 'invoice.cross-tenant-access' event so consumers can react to it.
+   */
+  async recordCrossTenantAccess(
+    accessingTenantId: string,
+    invoiceTenantId: string,
+    invoiceId: string,
+    event: AuditEvent,
+  ): Promise<CrossTenantAuditRecord> {
+    const entry = await this.append(event);
+    const record: CrossTenantAuditRecord = {
+      tenantId: accessingTenantId,
+      invoiceId,
+      event,
+      entry,
+      recordedAt: Date.now(),
+    };
+    this.crossTenantRecords.push(record);
+    this.emit({
+      type: 'invoice.cross-tenant-access',
+      tenantId: accessingTenantId,
+      invoiceId,
+      entry,
+      timestamp: record.recordedAt,
+    });
+    return record;
+  }
+
+  /**
+   * Queries recorded cross-tenant audit entries, optionally filtered by tenant
+   * and/or invoice. Returns a defensive copy to preserve isolation.
+   */
+  queryCrossTenantAudits(query: CrossTenantAuditQuery = {}): CrossTenantAuditRecord[] {
+    return this.crossTenantRecords
+      .filter(r => (query.tenantId === undefined || r.tenantId === query.tenantId))
+      .filter(r => (query.invoiceId === undefined || r.invoiceId === query.invoiceId))
+      .map(r => ({ ...r }));
+  }
+
+  /**
+   * Verifies that a tenant's recorded audit entries are intact and match the
+   * expected chain root, enforcing cross-tenant isolation.
+   */
+  async verifyTenantAudit(
+    tenantId: string,
+    expectedRoot: AuditTrailRoot,
+  ): Promise<{ valid: boolean; mismatchAt?: number; length?: number }> {
+    const tenantEntries = this.crossTenantRecords
+      .filter(r => r.tenantId === tenantId)
+      .map(r => r.entry);
+    const scoped = new AuditTrailHasher(tenantEntries);
+    return scoped.verify(expectedRoot);
+  }
+
+  /**
+   * Registers a listener for cross-tenant audit lifecycle events.
+   */
+  on(listener: CrossTenantAuditListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Removes a previously registered listener.
+   */
+  off(listener: CrossTenantAuditListener): void {
+    this.listeners.delete(listener);
+  }
+
+  private emit(event: CrossTenantAuditEvent): void {
+    for (const listener of this.listeners) {
+      listener(event);
+    }
+  }
+
+  /**
    * Computes a Merkle root over all current chain entry hashes using pairwise SHA-256 combining
    */
   async root(): Promise<AuditTrailRoot> {
