@@ -40,138 +40,115 @@ export function simulateAutoResolve(invoice: Invoice): AutoResolveSimulation {
 }
 
 /**
- * A single scenario in a batch simulation: an invoice to evaluate together
- * with an optional label used to identify it in the aggregated results.
+ * Lifecycle phase of a simulated transaction rollback.
  */
-export interface BatchSimulationScenario {
-  /** Optional human-readable label for the scenario. */
-  label?: string;
-  /** The invoice to simulate. */
-  invoice: Invoice;
+export type RollbackPhase = "start" | "success" | "failure";
+
+/**
+ * Event emitted as a simulated transaction rollback progresses through its
+ * lifecycle. `start` is emitted before the simulated transaction is applied,
+ * followed by exactly one terminal event (`success` or `failure`).
+ */
+export interface RollbackEvent {
+  phase: RollbackPhase;
+  /** Human-readable description of the phase. */
+  message: string;
+  /** Error that caused a `failure` event, when applicable. */
+  error?: Error;
 }
 
 /**
- * The outcome of a single scenario within a batch simulation.
+ * A single step in a simulated transaction. Each step is applied in order and
+ * may throw to signal that the transaction should be rolled back.
  */
-export interface BatchSimulationResult {
-  /** Index of the scenario in the original batch. */
-  index: number;
-  /** The scenario's label, when provided. */
-  label?: string;
-  /** The simulated outcome, or null when the scenario failed. */
-  simulation: AutoResolveSimulation | null;
-  /** Error message when the scenario failed to simulate. */
-  error: string | null;
+export interface RollbackStep<TState> {
+  /** Label used in emitted events and error messages. */
+  name: string;
+  /** Pure function that produces the next state from the current state. */
+  apply: (state: TState) => TState;
 }
 
 /**
- * Aggregated summary of a batch simulation run.
+ * Result of simulating a transaction rollback.
  */
-export interface BatchSimulationSummary {
-  /** Total number of scenarios in the batch. */
-  total: number;
-  /** Number of scenarios that simulated successfully. */
-  succeeded: number;
-  /** Number of scenarios that failed. */
-  failed: number;
-  /** Number of successful scenarios whose outcome would resolve. */
-  wouldResolve: number;
-  /** Number of successful scenarios whose outcome would not resolve. */
-  wouldNotResolve: number;
+export interface RollbackSimulationResult<TState> {
+  /** Whether every step applied without throwing. */
+  committed: boolean;
+  /** State after the simulation: the committed state or the original state. */
+  state: TState;
+  /** Name of the step that failed, or `null` when the transaction committed. */
+  failedStep: string | null;
+  /** Error thrown by the failing step, or `null` when the transaction committed. */
+  error: Error | null;
+  /** Ordered lifecycle events emitted during the simulation. */
+  events: RollbackEvent[];
 }
 
 /**
- * The full result of a batch simulation run.
- */
-export interface BatchSimulationReport {
-  /** Per-scenario results, in the same order as the input batch. */
-  results: BatchSimulationResult[];
-  /** Aggregated counts across the batch. */
-  summary: BatchSimulationSummary;
-}
-
-/**
- * Event handlers invoked during a batch simulation run.
- */
-export interface BatchSimulationEvents {
-  /** Called once when the batch begins, with the total scenario count. */
-  onStart?: (total: number) => void;
-  /** Called after each scenario completes, with its result. */
-  onProgress?: (result: BatchSimulationResult, completed: number, total: number) => void;
-  /** Called once when the batch finishes, with the aggregated report. */
-  onComplete?: (report: BatchSimulationReport) => void;
-  /** Called when a scenario fails, with the error and its index. */
-  onError?: (error: Error, index: number) => void;
-}
-
-/**
- * Run a batch of portfolio scenarios through {@link simulateAutoResolve} and
- * aggregate the outcomes.
+ * Simulate a transaction against an initial state, rolling back to that state
+ * if any step throws.
  *
- * Each scenario is evaluated independently: a failure in one scenario is
- * captured in its result and does not abort the batch. Events are emitted for
- * the batch start, per-scenario progress, per-scenario errors, and completion.
+ * Steps are applied in order to a working copy of the state. If a step throws,
+ * the working copy is discarded and the original state is returned, mirroring
+ * the all-or-nothing semantics of an on-chain transaction. Lifecycle events are
+ * emitted for the start of the simulation and for its terminal outcome.
  *
- * @param scenarios - The scenarios to simulate.
- * @param events    - Optional event handlers.
- * @returns The aggregated batch simulation report.
+ * Pure function — performs no RPC calls and never mutates `initialState`.
+ *
+ * @param initialState - State the transaction starts from and rolls back to.
+ * @param steps        - Ordered steps to apply.
+ * @param onEvent      - Optional listener invoked for each lifecycle event.
+ * @returns The simulation result, including the emitted events.
  */
-export function simulateBatch(
-  scenarios: BatchSimulationScenario[],
-  events: BatchSimulationEvents = {},
-): BatchSimulationReport {
-  const total = scenarios.length;
-  events.onStart?.(total);
+export function simulateTransactionRollback<TState>(
+  initialState: TState,
+  steps: ReadonlyArray<RollbackStep<TState>>,
+  onEvent?: (event: RollbackEvent) => void,
+): RollbackSimulationResult<TState> {
+  const events: RollbackEvent[] = [];
 
-  const results: BatchSimulationResult[] = [];
-  let succeeded = 0;
-  let failed = 0;
-  let wouldResolve = 0;
-  let wouldNotResolve = 0;
-
-  scenarios.forEach((scenario, index) => {
-    let result: BatchSimulationResult;
-    try {
-      const simulation = simulateAutoResolve(scenario.invoice);
-      result = {
-        index,
-        label: scenario.label,
-        simulation,
-        error: null,
-      };
-      succeeded += 1;
-      if (simulation.wouldResolve) {
-        wouldResolve += 1;
-      } else {
-        wouldNotResolve += 1;
-      }
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      result = {
-        index,
-        label: scenario.label,
-        simulation: null,
-        error: error.message,
-      };
-      failed += 1;
-      events.onError?.(error, index);
-    }
-
-    results.push(result);
-    events.onProgress?.(result, index + 1, total);
-  });
-
-  const report: BatchSimulationReport = {
-    results,
-    summary: {
-      total,
-      succeeded,
-      failed,
-      wouldResolve,
-      wouldNotResolve,
-    },
+  const emit = (event: RollbackEvent): void => {
+    events.push(event);
+    onEvent?.(event);
   };
 
-  events.onComplete?.(report);
-  return report;
+  emit({
+    phase: "start",
+    message: `Simulating transaction with ${steps.length} step(s)`,
+  });
+
+  let workingState = initialState;
+
+  for (const step of steps) {
+    try {
+      workingState = step.apply(workingState);
+    } catch (cause) {
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      emit({
+        phase: "failure",
+        message: `Step "${step.name}" failed; rolling back`,
+        error,
+      });
+      return {
+        committed: false,
+        state: initialState,
+        failedStep: step.name,
+        error,
+        events,
+      };
+    }
+  }
+
+  emit({
+    phase: "success",
+    message: `Transaction committed after ${steps.length} step(s)`,
+  });
+
+  return {
+    committed: true,
+    state: workingState,
+    failedStep: null,
+    error: null,
+    events,
+  };
 }

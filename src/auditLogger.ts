@@ -12,6 +12,28 @@ export interface AuditEntry {
   decodedXdr?: DecodedXDR;
 }
 
+/**
+ * A single audit event emitted by the SDK for compliance tracking.
+ *
+ * Unlike {@link AuditEntry}, which is a low-level sink record, an
+ * `AuditEvent` carries a stable `type` discriminator and a monotonically
+ * increasing `sequence` so downstream consumers can order and reconcile
+ * events reliably.
+ */
+export interface AuditEvent {
+  /** Stable event type discriminator, e.g. `"audit.log"`. */
+  type: string;
+  /** Monotonically increasing sequence number, starting at 1. */
+  sequence: number;
+  /** Wall-clock time the event was emitted (ms since epoch). */
+  timestamp: number;
+  /** The audit entry associated with this event. */
+  entry: AuditEntry;
+}
+
+/** Handler invoked for every emitted {@link AuditEvent}. */
+export type AuditEventListener = (event: AuditEvent) => void;
+
 const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
 
 /** Detect if a string value looks like base64-encoded XDR. */
@@ -23,13 +45,60 @@ const MIN_XDR_LENGTH = 40;
 export class AuditLogger {
   private readonly sink: (entry: AuditEntry) => void;
   private readonly splitAuditTrails = new Map<string, SplitAuditEntry[]>();
+  private readonly listeners = new Set<AuditEventListener>();
+  private sequence = 0;
 
   constructor(sink: (entry: AuditEntry) => void) {
     this.sink = sink;
   }
 
+  /**
+   * Subscribe to audit events. Returns an unsubscribe function.
+   *
+   * Listeners are invoked synchronously after the entry has been written to
+   * the configured sink, so a throwing listener can never prevent the audit
+   * record from being persisted.
+   */
+  on(listener: AuditEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** Remove a previously registered listener. */
+  off(listener: AuditEventListener): void {
+    this.listeners.delete(listener);
+  }
+
+  /** Emit an audit event to all registered listeners. */
+  private emit(entry: AuditEntry): void {
+    if (this.listeners.size === 0) {
+      return;
+    }
+    const event: AuditEvent = {
+      type: "audit.log",
+      sequence: ++this.sequence,
+      timestamp: entry.timestamp,
+      entry,
+    };
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A misbehaving listener must never break audit logging.
+      }
+    }
+  }
+
   log(entry: AuditEntry): void {
+    this.debugLog("log", {
+      method: entry.method,
+      success: entry.success,
+      durationMs: entry.durationMs,
+    });
     this.sink(entry);
+    this.emit(entry);
   }
 
   sanitize(params: Record<string, unknown>): Record<string, unknown> {
@@ -137,5 +206,105 @@ export class AuditLogger {
    */
   async exportSplitAuditTrail(invoiceId: string): Promise<SplitAuditEntry[]> {
     return [...(this.splitAuditTrails.get(invoiceId) ?? [])];
+  }
+
+  /**
+   * Subscribe to cross-tenant invoice audit lifecycle events.
+   *
+   * @returns an unsubscribe function.
+   */
+  onCrossTenantAudit(listener: CrossTenantAuditEventListener): () => void {
+    this.crossTenantListeners.add(listener);
+    return () => {
+      this.crossTenantListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Record a cross-tenant invoice audit entry.
+   *
+   * Persists the entry to the in-memory cross-tenant trail, writes a
+   * sanitized `AuditEntry` to the configured sink, and emits the appropriate
+   * lifecycle event:
+   * - `cross_tenant_access_detected` when the actor differs from the owner,
+   * - `cross_tenant_access_denied` when such access is unauthorized,
+   * - `invoice_audited` for every recorded entry.
+   */
+  recordCrossTenantInvoiceAudit(
+    entry: CrossTenantInvoiceAuditEntry,
+  ): void {
+    this.crossTenantAudits.push(entry);
+
+    this.log({
+      timestamp: entry.timestamp,
+      method: "cross_tenant_invoice_audit",
+      params: this.sanitize({
+        ownerTenantId: entry.ownerTenantId,
+        actorTenantId: entry.actorTenantId,
+        invoiceId: entry.invoiceId,
+        action: entry.action,
+        authorized: entry.authorized,
+        ...(entry.metadata ?? {}),
+      }),
+      success: entry.authorized,
+      durationMs: 0,
+    });
+
+    const isCrossTenant = entry.actorTenantId !== entry.ownerTenantId;
+    if (isCrossTenant) {
+      this.emitCrossTenantAudit({
+        type: "cross_tenant_access_detected",
+        entry,
+      });
+      if (!entry.authorized) {
+        this.emitCrossTenantAudit({
+          type: "cross_tenant_access_denied",
+          entry,
+        });
+      }
+    }
+    this.emitCrossTenantAudit({ type: "invoice_audited", entry });
+  }
+
+  /**
+   * Query recorded cross-tenant invoice audit entries.
+   *
+   * All filters are optional and combined with AND semantics. Results are
+   * returned in the order they were recorded.
+   */
+  queryCrossTenantInvoiceAudits(filter?: {
+    ownerTenantId?: string;
+    actorTenantId?: string;
+    invoiceId?: string;
+    action?: string;
+    authorized?: boolean;
+  }): CrossTenantInvoiceAuditEntry[] {
+    return this.crossTenantAudits.filter((entry) => {
+      if (filter?.ownerTenantId && entry.ownerTenantId !== filter.ownerTenantId) {
+        return false;
+      }
+      if (filter?.actorTenantId && entry.actorTenantId !== filter.actorTenantId) {
+        return false;
+      }
+      if (filter?.invoiceId && entry.invoiceId !== filter.invoiceId) {
+        return false;
+      }
+      if (filter?.action && entry.action !== filter.action) {
+        return false;
+      }
+      if (
+        filter?.authorized !== undefined &&
+        entry.authorized !== filter.authorized
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }
+
+  private emitCrossTenantAudit(event: CrossTenantAuditEvent): void {
+    for (const listener of this.crossTenantListeners) {
+      listener(event);
+    }
   }
 }

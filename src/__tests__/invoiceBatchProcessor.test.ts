@@ -5,11 +5,23 @@
  *  1. A batch where one invoice throws continues processing remaining invoices.
  *  2. The result object includes `succeeded` and `failed` arrays with correct contents.
  *  3. A batch where all invoices fail returns an empty `succeeded` array.
+ *
+ * Transaction builder helper tests for complex multi-op invoices (#904).
+ *
+ * These tests verify that:
+ *  4. A multi-op invoice composes all operations into a single transaction.
+ *  5. Lifecycle events are emitted for build/add/complete.
+ *  6. Building an invoice with no operations is rejected.
  */
 
 import { describe, it, expect, vi } from "vitest";
 import { InvoiceBatchProcessor } from "../invoiceBatchProcessor.js";
 import type { InvoicePaymentSubmitter } from "../invoiceBatchProcessor.js";
+import {
+  TransactionBuilder,
+  type TransactionOperation,
+  type TransactionBuilderEvent,
+} from "../transactionBuilder.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -20,6 +32,16 @@ async function drain<T>(iter: AsyncIterableIterator<T>): Promise<T[]> {
   const results: T[] = [];
   for await (const item of iter) results.push(item);
   return results;
+}
+
+/** Build a simple payment operation for the given invoice. */
+function paymentOp(invoiceId: string, amount: bigint): TransactionOperation {
+  return {
+    type: "payment",
+    invoiceId,
+    amount,
+    asset: "native",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -140,5 +162,99 @@ describe("InvoiceBatchProcessor – partial-failure handling", () => {
     expect(failed).toHaveLength(3);
     expect(failed.every((r) => r.status === "failed")).toBe(true);
     expect(failed.every((r) => r.error === "network error")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests – transaction builder helper (#904)
+// ---------------------------------------------------------------------------
+
+describe("TransactionBuilder – complex multi-op invoices", () => {
+  // ── Criterion 4: multi-op composition ────────────────────────────────────
+
+  it("composes multiple operations into a single transaction", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+
+    builder
+      .addOperation(paymentOp("inv1", 10n))
+      .addOperation(paymentOp("inv2", 20n))
+      .addOperation({
+        type: "memo",
+        invoiceId: "inv1",
+        text: "batch settlement",
+      });
+
+    const tx = builder.build();
+
+    expect(tx.payer).toBe("GPAYER");
+    expect(tx.operations).toHaveLength(3);
+    expect(tx.operations.map((op) => op.type)).toEqual([
+      "payment",
+      "payment",
+      "memo",
+    ]);
+    expect(tx.operations[0]).toMatchObject({ invoiceId: "inv1", amount: 10n });
+    expect(tx.operations[1]).toMatchObject({ invoiceId: "inv2", amount: 20n });
+  });
+
+  it("supports adding a batch of operations at once", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+
+    builder.addOperations([
+      paymentOp("inv1", 1n),
+      paymentOp("inv2", 2n),
+      paymentOp("inv3", 3n),
+    ]);
+
+    const tx = builder.build();
+    expect(tx.operations).toHaveLength(3);
+    expect(tx.operations.map((op) => op.invoiceId)).toEqual([
+      "inv1",
+      "inv2",
+      "inv3",
+    ]);
+  });
+
+  // ── Criterion 5: lifecycle event emission ────────────────────────────────
+
+  it("emits build/add/complete lifecycle events", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+    const events: TransactionBuilderEvent[] = [];
+    builder.on((event) => events.push(event));
+
+    builder.addOperation(paymentOp("inv1", 5n));
+    builder.addOperation(paymentOp("inv2", 5n));
+    const tx = builder.build();
+    builder.complete(tx);
+
+    expect(events.map((e) => e.type)).toEqual([
+      "add",
+      "add",
+      "build",
+      "complete",
+    ]);
+    expect(events[0]).toMatchObject({ type: "add", operationCount: 1 });
+    expect(events[1]).toMatchObject({ type: "add", operationCount: 2 });
+    expect(events[2]).toMatchObject({ type: "build", operationCount: 2 });
+    expect(events[3]).toMatchObject({ type: "complete", operationCount: 2 });
+  });
+
+  it("allows unsubscribing from lifecycle events", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+    const listener = vi.fn();
+    const off = builder.on(listener);
+
+    builder.addOperation(paymentOp("inv1", 1n));
+    off();
+    builder.addOperation(paymentOp("inv2", 1n));
+
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Criterion 6: empty transaction rejected ──────────────────────────────
+
+  it("throws when building a transaction with no operations", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+    expect(() => builder.build()).toThrow(/no operations/i);
   });
 });

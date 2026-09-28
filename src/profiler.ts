@@ -27,7 +27,25 @@ export interface RpcCallTiming {
   operation: string;
   /** Duration in milliseconds. */
   durationMs: number;
+  /** Unix timestamp (ms) when the RPC call started, for nesting. */
+  timestamp: number;
 }
+
+/**
+ * Methods on the Soroban RPC client that the profiler wraps to capture
+ * per-RPC timings nested inside the SDK method that issued them.
+ */
+const PROFILED_RPC_METHODS = [
+  "getTransaction",
+  "getLedgerEntries",
+  "simulateTransaction",
+  "sendTransaction",
+  "getAccount",
+  "getHealth",
+  "getLatestLedger",
+  "getEvents",
+  "getVersion",
+] as const;
 
 /** An aggregated snapshot of one start/stop recording cycle. */
 export interface ProfileSession {
@@ -79,6 +97,7 @@ export interface SpeedscopeEventedProfile {
  */
 export interface SpeedscopeProfile {
   $schema: "https://www.speedscope.app/file-format-schema.json";
+  exporter: string;
   version: "0.6.0";
   name: string;
   activeProfileIndex: number;
@@ -120,6 +139,12 @@ export class ProfilerSession {
   private currentStartedAt = 0;
   private currentStoppedAt = 0;
   private originalMethods = new Map<string, Function>();
+  private originalRpcMethods = new Map<object, Map<string, Function>>();
+  /**
+   * Per-invocation RPC sink. Set by the method wrapper before delegating so
+   * that concurrent SDK calls do not cross-contaminate each other's timings.
+   */
+  private activeRpcSink: RpcCallTiming[] | null = null;
 
   constructor(options: ProfilerSessionOptions = {}) {
     this.sessionName = options.name ?? "StellarSplit SDK";
@@ -152,8 +177,16 @@ export class ProfilerSession {
         const startTs = Date.now();
         const rpcCalls: RpcCallTiming[] = [];
 
+        // Route any RPC calls made during this invocation into our sink.
+        const previousSink = thisSession.activeRpcSink;
+        thisSession.activeRpcSink = rpcCalls;
+        const restoreSink = (): void => {
+          thisSession.activeRpcSink = previousSink;
+        };
+
         const record = (success: boolean, error?: string): void => {
           const durationMs = performance.now() - startTime;
+          restoreSink();
           thisSession.currentEntries.push({
             method: methodName,
             durationMs,
@@ -190,9 +223,88 @@ export class ProfilerSession {
       } as unknown as Function;
     }
 
+    this.instrumentRpc();
     this.currentEntries = [];
     this.currentStartedAt = Date.now();
     this.active = true;
+  }
+
+  /**
+   * Wrap each client's Soroban RPC server so individual RPC round-trips are
+   * timed and attributed to the SDK method that issued them.
+   *
+   * Patching the server (rather than each SDK call site) keeps the
+   * instrumentation to one place, so new SDK methods are profiled for free.
+   */
+  private instrumentRpc(): void {
+    for (const client of StellarSplitClient._instances) {
+      const server = (client as unknown as { server?: Record<string, unknown> }).server;
+      if (!server || typeof server !== "object") continue;
+
+      const originals = new Map<string, Function>();
+      const thisSession = this;
+
+      for (const methodName of PROFILED_RPC_METHODS) {
+        const original = server[methodName];
+        if (typeof original !== "function") continue;
+        originals.set(methodName, original as Function);
+
+        server[methodName] = function (this: unknown, ...args: unknown[]) {
+          const start = performance.now();
+          const startedAt = Date.now();
+          const sink = thisSession.activeRpcSink;
+
+          const finish = (): void => {
+            // Only record when a sink is active, i.e. inside a profiled call.
+            if (!sink) return;
+            sink.push({
+              operation: methodName,
+              durationMs: performance.now() - start,
+              timestamp: startedAt,
+            });
+          };
+
+          let result: unknown;
+          try {
+            result = (original as Function).apply(this, args);
+          } catch (err: unknown) {
+            finish();
+            throw err;
+          }
+
+          if (result && typeof (result as Promise<unknown>).then === "function") {
+            return (result as Promise<unknown>).then(
+              (value: unknown) => {
+                finish();
+                return value;
+              },
+              (err: unknown) => {
+                finish();
+                return Promise.reject(err);
+              },
+            );
+          }
+
+          finish();
+          return result;
+        };
+      }
+
+      if (originals.size > 0) {
+        this.originalRpcMethods.set(server as object, originals);
+      }
+    }
+  }
+
+  /** Restore the RPC servers wrapped by {@link instrumentRpc}. */
+  private restoreRpc(): void {
+    for (const [server, originals] of this.originalRpcMethods.entries()) {
+      for (const [methodName, original] of originals.entries()) {
+        (server as Record<string, unknown>)[methodName] = original;
+      }
+    }
+    this.originalRpcMethods.clear();
+    this.activeRpcSink = null;
   }
 
   // -------------------------------------------------------------------------
@@ -222,6 +334,7 @@ export class ProfilerSession {
 
     this.active = false;
     this.originalMethods.clear();
+    this.restoreRpc();
 
     return this.getReport();
   }
@@ -272,16 +385,18 @@ export class ProfilerSession {
         const methodFrame = getFrame(entry.method);
         events.push({ type: "O", at: relStart, frame: methodFrame });
 
-        // Emit nested RPC call events (synthesised, evenly distributed within
-        // the parent window so the flame graph is always valid)
+        // Emit nested RPC frames at their real offsets within the parent
+        // window. Clamping to the parent bounds keeps the flame graph valid
+        // even if a timer drifts slightly past the enclosing call.
         if (entry.rpcCalls && entry.rpcCalls.length > 0) {
-          let cursor = relStart;
           for (const rpc of entry.rpcCalls) {
             const rpcFrame = getFrame(`rpc:${rpc.operation}`);
-            const rpcEnd = Math.min(cursor + rpc.durationMs, relEnd);
-            events.push({ type: "O", at: cursor, frame: rpcFrame });
+            const rpcStart = Math.max(relStart, rpc.timestamp - sessionStart);
+            const rpcEnd = Math.min(rpcStart + rpc.durationMs, relEnd);
+            if (rpcEnd <= rpcStart) continue;
+
+            events.push({ type: "O", at: rpcStart, frame: rpcFrame });
             events.push({ type: "C", at: rpcEnd, frame: rpcFrame });
-            cursor = rpcEnd;
           }
         }
 
@@ -309,6 +424,8 @@ export class ProfilerSession {
 
     return {
       $schema: "https://www.speedscope.app/file-format-schema.json",
+      // Required by the speedscope schema; identifies the producing tool.
+      exporter: "@stellar-split/sdk",
       version: "0.6.0",
       name: this.sessionName,
       activeProfileIndex: 0,

@@ -3,41 +3,89 @@ import type Transport from "@ledgerhq/hw-transport";
 import Str from "@ledgerhq/hw-app-str";
 import type { WalletAdapter } from "../types.js";
 
-/** Lifecycle events emitted by the signing delegation flow. */
-export type DelegationEventType = "created" | "used" | "revoked";
+/**
+ * Minimum Ledger device firmware version supported for signing Stellar
+ * transactions. Older firmware lacks support for newer Stellar transaction
+ * features (multi-operation submissions and the newer envelope extensions),
+ * which makes signing fail silently.
+ */
+export const MIN_LEDGER_FIRMWARE = "2.0.0";
 
-export interface DelegationEvent {
-  type: DelegationEventType;
-  delegationId: string;
-  publicKey: string;
-  timestamp: number;
+/**
+ * Thrown before any signing attempt when the connected Ledger device runs a
+ * firmware version older than {@link MIN_LEDGER_FIRMWARE}.
+ */
+export class LedgerFirmwareTooOldError extends Error {
+  /** Firmware version reported by the device. */
+  readonly actualVersion: string;
+  /** Minimum firmware version required to sign. */
+  readonly requiredVersion: string;
+
+  constructor(actualVersion: string, requiredVersion: string = MIN_LEDGER_FIRMWARE) {
+    super(
+      `Ledger firmware ${actualVersion} is not supported. ` +
+        `Update the device to firmware ${requiredVersion} or newer to sign Stellar transactions.`,
+    );
+    this.name = "LedgerFirmwareTooOldError";
+    this.actualVersion = actualVersion;
+    this.requiredVersion = requiredVersion;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
 }
 
-export type DelegationEventListener = (event: DelegationEvent) => void;
+/** Construction options for {@link LedgerAdapter}. */
+export interface LedgerAdapterOptions {
+  /**
+   * When `true`, the pre-signing firmware version check is skipped entirely.
+   * Intended for test environments (and for callers that have already verified
+   * the device out-of-band). Defaults to `false`.
+   */
+  skipFirmwareCheck?: boolean;
+  /**
+   * Overrides how the device firmware version is read. Defaults to the
+   * on-device `GET_VERSION` APDU sent over the transport.
+   */
+  getFirmwareVersion?: (transport: Transport) => Promise<string>;
+}
 
-/** A scoped signing delegation granted to a custody solution. */
-export interface SigningDelegation {
-  id: string;
-  /** Public key of the delegating account. */
-  publicKey: string;
-  /** Identifier of the custody solution receiving the delegation. */
-  delegatee: string;
-  /** Optional expiry (epoch ms). Undefined means no expiry. */
-  expiresAt?: number;
-  /** Optional maximum number of signatures allowed. */
-  maxUses?: number;
-  uses: number;
-  revoked: boolean;
+/**
+ * Parse a dotted version string into numeric segments.
+ * Non-numeric segments (e.g. a `1.2.3-rc1` suffix) count as `0`.
+ */
+function parseVersionSegments(version: string): number[] {
+  return version.split(".").map((segment) => {
+    const parsed = Number.parseInt(segment, 10);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  });
+}
+
+/**
+ * Compare two dotted firmware version strings segment by segment.
+ *
+ * @returns A negative number when `a < b`, `0` when equal, positive when `a > b`.
+ */
+export function compareFirmwareVersions(a: string, b: string): number {
+  const left = parseVersionSegments(a);
+  const right = parseVersionSegments(b);
+  const length = Math.max(left.length, right.length);
+  for (let i = 0; i < length; i += 1) {
+    const delta = (left[i] ?? 0) - (right[i] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
 }
 
 /** Ledger hardware wallet adapter implementing WalletAdapter. */
 export class LedgerAdapter implements WalletAdapter {
   private readonly path: string;
-  private readonly delegations = new Map<string, SigningDelegation>();
-  private readonly listeners = new Set<DelegationEventListener>();
+  private readonly skipFirmwareCheck: boolean;
+  private readonly getFirmwareVersion: (transport: Transport) => Promise<string>;
 
-  constructor(path = "44'/148'/0'") {
+  constructor(path = "44'/148'/0'", options: LedgerAdapterOptions = {}) {
     this.path = path;
+    this.skipFirmwareCheck = options.skipFirmwareCheck ?? false;
+    this.getFirmwareVersion =
+      options.getFirmwareVersion ?? ((transport) => this.queryFirmwareVersion(transport));
   }
 
   async getAddress(): Promise<string> {
@@ -54,6 +102,7 @@ export class LedgerAdapter implements WalletAdapter {
   async signTransaction(xdr: string, _network: string): Promise<string> {
     const transport = await this.openTransport();
     try {
+      await this.assertFirmwareSupported(transport);
       const str = new Str(transport);
       const txBytes = Uint8Array.from(atob(xdr), (c) => c.charCodeAt(0));
       const { signature } = await str.signTransaction(
@@ -68,124 +117,33 @@ export class LedgerAdapter implements WalletAdapter {
   }
 
   /**
-   * Register a listener for delegation lifecycle events.
-   * Returns an unsubscribe function.
+   * Reject with {@link LedgerFirmwareTooOldError} when the device firmware is
+   * older than {@link MIN_LEDGER_FIRMWARE}. No-op when the check is skipped.
    */
-  onDelegationEvent(listener: DelegationEventListener): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
+  private async assertFirmwareSupported(transport: Transport): Promise<void> {
+    if (this.skipFirmwareCheck) return;
+    const version = await this.getFirmwareVersion(transport);
+    if (compareFirmwareVersions(version, MIN_LEDGER_FIRMWARE) < 0) {
+      throw new LedgerFirmwareTooOldError(version);
+    }
   }
 
   /**
-   * Create a signing delegation for a custody solution. The delegation is
-   * scoped to the adapter's account and may be bounded by expiry and/or a
-   * maximum number of uses.
+   * Query the device firmware version using the BOLOS `GET_VERSION` APDU
+   * (`CLA 0xE0`, `INS 0x01`). The transport strips the status word, leaving a
+   * payload whose trailing three bytes are `major.minor.patch` (some devices
+   * prefix a format/target byte, so the last three bytes are used).
    */
-  async createDelegation(options: {
-    delegatee: string;
-    expiresAt?: number;
-    maxUses?: number;
-  }): Promise<SigningDelegation> {
-    if (!options.delegatee) {
-      throw new Error("A delegatee is required to create a signing delegation.");
-    }
-    const publicKey = await this.getAddress();
-    const delegation: SigningDelegation = {
-      id: this.generateDelegationId(),
-      publicKey,
-      delegatee: options.delegatee,
-      expiresAt: options.expiresAt,
-      maxUses: options.maxUses,
-      uses: 0,
-      revoked: false,
-    };
-    this.delegations.set(delegation.id, delegation);
-    this.emit({
-      type: "created",
-      delegationId: delegation.id,
-      publicKey,
-      timestamp: Date.now(),
-    });
-    return delegation;
-  }
-
-  /** Retrieve a previously created delegation by id. */
-  getDelegation(delegationId: string): SigningDelegation | undefined {
-    return this.delegations.get(delegationId);
-  }
-
-  /**
-   * Sign a transaction on behalf of a custody solution using an existing
-   * delegation. Enforces revocation, expiry, and usage limits before
-   * delegating to the hardware signer.
-   */
-  async signWithDelegation(
-    delegationId: string,
-    xdr: string,
-    network: string
-  ): Promise<string> {
-    const delegation = this.delegations.get(delegationId);
-    if (!delegation) {
-      throw new Error(`Unknown signing delegation: ${delegationId}`);
-    }
-    if (delegation.revoked) {
-      throw new Error(`Signing delegation ${delegationId} has been revoked.`);
-    }
-    if (delegation.expiresAt !== undefined && Date.now() > delegation.expiresAt) {
-      throw new Error(`Signing delegation ${delegationId} has expired.`);
-    }
-    if (
-      delegation.maxUses !== undefined &&
-      delegation.uses >= delegation.maxUses
-    ) {
+  private async queryFirmwareVersion(transport: Transport): Promise<string> {
+    const response = await transport.send(0xe0, 0x01, 0x00, 0x00);
+    const bytes = Array.from(response as unknown as Uint8Array);
+    const versionBytes = bytes.length > 3 ? bytes.slice(-3) : bytes;
+    if (versionBytes.length < 3) {
       throw new Error(
-        `Signing delegation ${delegationId} has reached its maximum number of uses.`
+        `Unexpected firmware version response from Ledger device (${bytes.length} byte(s)).`,
       );
     }
-
-    const signature = await this.signTransaction(xdr, network);
-    delegation.uses += 1;
-    this.emit({
-      type: "used",
-      delegationId: delegation.id,
-      publicKey: delegation.publicKey,
-      timestamp: Date.now(),
-    });
-    return signature;
-  }
-
-  /** Revoke a delegation so it can no longer be used for signing. */
-  revokeDelegation(delegationId: string): void {
-    const delegation = this.delegations.get(delegationId);
-    if (!delegation) {
-      throw new Error(`Unknown signing delegation: ${delegationId}`);
-    }
-    if (delegation.revoked) {
-      return;
-    }
-    delegation.revoked = true;
-    this.emit({
-      type: "revoked",
-      delegationId: delegation.id,
-      publicKey: delegation.publicKey,
-      timestamp: Date.now(),
-    });
-  }
-
-  private emit(event: DelegationEvent): void {
-    for (const listener of this.listeners) {
-      listener(event);
-    }
-  }
-
-  private generateDelegationId(): string {
-    const cryptoObj = globalThis.crypto;
-    if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
-      return cryptoObj.randomUUID();
-    }
-    return `delegation-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return versionBytes.join(".");
   }
 
   private async openTransport(): Promise<Transport> {
