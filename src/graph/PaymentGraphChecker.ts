@@ -39,6 +39,52 @@ export class UnreachableRecipientError extends Error {
   }
 }
 
+/** Represents a single directed edge in a payment graph. */
+export interface PaymentGraphEdge {
+  /** Source node (account or asset identifier). */
+  from: string;
+  /** Destination node. */
+  to: string;
+  /**
+   * Numeric weight for this edge (e.g. an amount or fee multiplier).
+   * Zero-weight edges are allowed (pass-through hops); negative weights are not.
+   */
+  weight: number;
+}
+
+/** A payment graph expressed as a list of directed, weighted edges. */
+export interface PaymentGraph {
+  edges: PaymentGraphEdge[];
+}
+
+/** Result returned by `checkGraph()`. */
+export interface GraphValidationResult {
+  /** `true` when all edges pass validation. */
+  valid: boolean;
+  /**
+   * Human-readable description of the first violation found, or `undefined`
+   * when the graph is valid.
+   */
+  reason?: string;
+}
+
+/**
+ * Validate the structural integrity of a payment graph.
+ *
+ * Currently enforced rules:
+ * - No edge may have a negative weight. Zero-weight edges (pass-through hops)
+ *   are permitted. A negative-weight edge can cause unbounded fund extraction
+ *   when the graph is traversed greedily.
+ *
+ * @example
+ * ```ts
+ * const result = checker.checkGraph(graph);
+ * if (!result.valid) {
+ *   throw new Error(result.reason);
+ * }
+ * ```
+ */
+
 interface CacheKey {
   sourceAsset: string;
   sourceAccount: string;
@@ -125,6 +171,31 @@ export class PaymentGraphChecker {
     }
 
     return result;
+  }
+
+  /**
+   * Validate a payment graph for structural correctness.
+   *
+   * Returns a failure result when any edge has a negative weight, naming the
+   * offending edge (`source → target`) in the reason message.
+   * Zero-weight edges are permitted — they represent pass-through hops where
+   * no fee or amount is exchanged.
+   *
+   * Valid graphs (all weights ≥ 0) return `{ valid: true }`.
+   *
+   * @param graph - The directed payment graph to validate.
+   */
+  checkGraph(graph: PaymentGraph): GraphValidationResult {
+    for (const edge of graph.edges) {
+      if (edge.weight < 0) {
+        return {
+          valid: false,
+          reason: `Negative-weight edge detected: ${edge.from} → ${edge.to} (weight: ${edge.weight})`,
+        };
+      }
+    }
+
+    return { valid: true };
   }
 
   /**

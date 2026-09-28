@@ -1,5 +1,10 @@
 /**
  * FreighterAdapter — Adapter for the Freighter wallet extension.
+ *
+ * Before any Freighter API call the adapter checks whether the extension is
+ * installed (`window.freighter`). If it is absent a `FreighterNotInstalledError`
+ * is thrown with the install URL so callers can surface an actionable message
+ * to the user instead of a cryptic TypeError.
  */
 
 import type { WalletAdapter } from "../../types.js";
@@ -16,6 +21,26 @@ declare global {
   }
 }
 
+/** Install URL shown to users when the Freighter extension is not found. */
+const FREIGHTER_INSTALL_URL = "https://www.freighter.app";
+
+/**
+ * Thrown when a Freighter API call is attempted but the browser extension is
+ * not installed. The `message` includes the install URL so it can be shown
+ * directly to the user.
+ */
+export class FreighterNotInstalledError extends Error {
+  constructor() {
+    super(
+      `Freighter wallet extension is not installed. ` +
+        `Install it from ${FREIGHTER_INSTALL_URL}`
+    );
+    this.name = "FreighterNotInstalledError";
+    // Maintain correct instanceof checks in transpiled environments.
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 export class FreighterAdapter implements WalletAdapter {
   readonly name = "Freighter";
   private accountChangeHandlers: Array<(address: string) => void> = [];
@@ -23,11 +48,9 @@ export class FreighterAdapter implements WalletAdapter {
   private lastKnownAddress: string | null = null;
 
   async connect(): Promise<string> {
-    if (!window.freighter) {
-      throw new Error("Freighter wallet not installed");
-    }
+    this.assertInstalled();
 
-    const address = await window.freighter.getPublicKey();
+    const address = await window.freighter!.getPublicKey();
     this.lastKnownAddress = address;
     
     // Start polling for account changes (Freighter doesn't have a native event)
@@ -37,19 +60,15 @@ export class FreighterAdapter implements WalletAdapter {
   }
 
   async sign(xdr: string, network: string): Promise<string> {
-    if (!window.freighter) {
-      throw new Error("Freighter wallet not installed");
-    }
+    this.assertInstalled();
 
-    return await window.freighter.signTransaction(xdr, network);
+    return await window.freighter!.signTransaction(xdr, network);
   }
 
   async getAddress(): Promise<string> {
-    if (!window.freighter) {
-      throw new Error("Freighter wallet not installed");
-    }
+    this.assertInstalled();
 
-    return await window.freighter.getPublicKey();
+    return await window.freighter!.getPublicKey();
   }
 
   async signTransaction(xdr: string, network: string): Promise<string> {
@@ -74,6 +93,20 @@ export class FreighterAdapter implements WalletAdapter {
         this.accountChangeHandlers.splice(index, 1);
       }
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Assert that the Freighter extension is available in the current window.
+   * Throws `FreighterNotInstalledError` when it is not.
+   */
+  private assertInstalled(): void {
+    if (!window.freighter) {
+      throw new FreighterNotInstalledError();
+    }
   }
 
   private startAccountChangePolling(): void {
