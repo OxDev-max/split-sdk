@@ -28,6 +28,21 @@
       "types": "./dist/utils.d.ts",
       "import": "./dist/utils.js",
       "require": "./dist/utils.cjs"
+    },
+    "./mock": {
+      "types": "./dist/mock/index.d.ts",
+      "import": "./dist/mock/index.js",
+      "require": "./dist/mock/index.cjs"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js",
+      "require": "./dist/react/index.cjs"
+    },
+    "./telemetry": {
+      "types": "./dist/telemetryModule.d.ts",
+      "import": "./dist/telemetryModule.js",
+      "require": "./dist/telemetryModule.cjs"
     }
   },
   "files": [
