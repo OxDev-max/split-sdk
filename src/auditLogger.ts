@@ -113,6 +113,69 @@ export class AuditLogger {
   }
 
   /**
+   * Register a subscription for invoice notifications.
+   *
+   * @param subscription - The subscription to register.
+   * @returns An unsubscribe function that removes the subscription.
+   */
+  subscribeToInvoice(
+    subscription: InvoiceNotificationSubscription,
+  ): () => void {
+    const existing = this.invoiceSubscriptions.get(subscription.invoiceId) ?? [];
+    existing.push(subscription);
+    this.invoiceSubscriptions.set(subscription.invoiceId, existing);
+
+    return () => this.unsubscribeFromInvoice(subscription.id);
+  }
+
+  /**
+   * Remove a previously registered invoice notification subscription by id.
+   *
+   * @returns `true` when a subscription was removed, `false` otherwise.
+   */
+  unsubscribeFromInvoice(subscriptionId: string): boolean {
+    for (const [invoiceId, subs] of this.invoiceSubscriptions) {
+      const index = subs.findIndex((s) => s.id === subscriptionId);
+      if (index !== -1) {
+        subs.splice(index, 1);
+        if (subs.length === 0) {
+          this.invoiceSubscriptions.delete(invoiceId);
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Emit an invoice notification to all matching subscribers.
+   *
+   * Subscribers registered for the invoice receive the notification when they
+   * have no event filter or when their filter includes the emitted event.
+   * Handler errors are isolated so one failing subscriber cannot prevent
+   * delivery to the others.
+   *
+   * @param notification - The notification to deliver.
+   * @returns The number of subscribers the notification was delivered to.
+   */
+  emitInvoiceNotification(notification: InvoiceNotification): number {
+    const subs = this.invoiceSubscriptions.get(notification.invoiceId);
+    if (!subs || subs.length === 0) return 0;
+
+    let delivered = 0;
+    for (const sub of subs) {
+      if (sub.events && !sub.events.includes(notification.event)) continue;
+      try {
+        sub.handler(notification);
+        delivered += 1;
+      } catch {
+        // Isolate subscriber failures; never break notification delivery.
+      }
+    }
+    return delivered;
+  }
+
+  /**
    * Log an entry with automatic XDR decoding.
    *
    * When `xdrPayload` is provided, it is decoded and attached as `decodedXdr`.

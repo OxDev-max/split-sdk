@@ -147,6 +147,16 @@ export class OperationBuilder {
     Set<OperationBuilderListener>
   >();
 
+  // Multi-signature state
+  private readonly signers = new Map<string, number>();
+  private thresholds: Required<SetThresholdsOptions> = {
+    masterWeight: 1,
+    low: 0,
+    medium: 0,
+    high: 0,
+  };
+  private readonly listeners = new Set<MultiSigEventListener>();
+
   constructor(config: OperationBuilderConfig) {
     this.config = config;
     this.server = new SorobanRpc.Server(config.rpcUrl, {
@@ -252,6 +262,79 @@ export class OperationBuilder {
   setTimebounds(opts: TimeboundsOptions): this {
     this.timebounds = opts;
     return this;
+  }
+
+  // --------------------------------------------------------------------------
+  // Multi-signature builder
+  // --------------------------------------------------------------------------
+
+  /**
+   * Registers a signer with an optional weight. Re-adding an existing key
+   * updates its weight. Emits a `signerAdded` event.
+   */
+  addSigner(opts: AddSignerOptions): this {
+    const weight = opts.weight ?? 1;
+    this.signers.set(opts.key, weight);
+    this._emit({ type: "signerAdded", key: opts.key, weight });
+    return this;
+  }
+
+  /**
+   * Removes a previously registered signer. Emits a `signerRemoved` event.
+   */
+  removeSigner(key: string): this {
+    if (this.signers.delete(key)) {
+      this._emit({ type: "signerRemoved", key });
+    }
+    return this;
+  }
+
+  /**
+   * Sets the account thresholds. Emits a `thresholdsSet` event.
+   */
+  setThresholds(opts: SetThresholdsOptions): this {
+    this.thresholds = {
+      masterWeight: opts.masterWeight ?? this.thresholds.masterWeight,
+      low: opts.low ?? this.thresholds.low,
+      medium: opts.medium ?? this.thresholds.medium,
+      high: opts.high ?? this.thresholds.high,
+    };
+    this._emit({ type: "thresholdsSet", thresholds: { ...this.thresholds } });
+    return this;
+  }
+
+  /**
+   * Returns the total signing weight of all registered signers.
+   */
+  getTotalWeight(): number {
+    let total = 0;
+    for (const weight of this.signers.values()) {
+      total += weight;
+    }
+    return total;
+  }
+
+  /**
+   * Returns true when the registered signers meet the high threshold.
+   */
+  isThresholdMet(): boolean {
+    return this.getTotalWeight() >= this.thresholds.high;
+  }
+
+  /**
+   * Subscribes to builder lifecycle events. Returns an unsubscribe function.
+   */
+  onEvent(listener: MultiSigEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private _emit(event: MultiSigEvent): void {
+    for (const listener of this.listeners) {
+      listener(event);
+    }
   }
 
   // --------------------------------------------------------------------------
