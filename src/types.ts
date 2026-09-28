@@ -326,6 +326,15 @@ export interface Invoice {
   groupId?: string;
   /** Ledger sequence when this invoice was last modified. */
   lastModifiedLedger?: number;
+  /**
+   * Optional free-form labels used for tag-based querying via
+   * `client.queryInvoices({ tags: [...] })`.
+   *
+   * When omitted, the query engine falls back to parsing `#hashtags` out of
+   * `memo`, so invoices created with a tagged memo are queryable without any
+   * contract change.
+   */
+  tags?: string[];
   /** IDs of invoices that must be paid before this one. */
   prerequisites?: string[];
   /** ID of the parent invoice this was cloned from (clone chain). */
@@ -487,6 +496,12 @@ export interface CreateInvoiceParams {
   /** Optional memo / description. */
   memo?: string;
   /**
+   * When `true`, simulate the transaction against Soroban RPC instead of
+   * submitting it, and resolve with a {@link SimulationResult} (issue #844).
+   * @default false
+   */
+  simulate?: boolean;
+  /**
    * When `true`, skip the `RecipientBalancePreCheck` that normally runs
    * before the invoice is submitted. Use only for advanced flows where you
    * have already validated recipients independently.
@@ -535,6 +550,12 @@ export interface PayParams {
    * fails to reach its goal. Defaults to false.
    */
   donateOnFailure?: boolean;
+  /**
+   * When `true`, simulate the payment against Soroban RPC instead of
+   * submitting it, and resolve with a {@link SimulationResult} (issue #844).
+   * @default false
+   */
+  simulate?: boolean;
 }
 
 /** @deprecated Use PayParams instead. */
@@ -787,7 +808,48 @@ export interface CloneOverrides {
    * recipient account lookups.
    */
   horizonUrl?: string;
+  /**
+   * Optional new title/memo stored on the cloned invoice.
+   * Serialised as the `new_title` entry of the clone override map (issue #850).
+   */
+  newTitle?: string;
 }
+
+/**
+ * Field-level overrides accepted by {@link StellarSplitClient.cloneInvoice}
+ * (issue #850). These are mapped onto the contract's `clone_invoice` override
+ * map after validation, mirroring the checks applied by `createInvoice`.
+ */
+export interface InvoiceParamOverrides {
+  /** Optional new title/memo for the cloned invoice (non-empty string). */
+  title?: string;
+  /** Optional new deadline as a future unix timestamp in seconds. */
+  deadline?: number;
+  /** Optional new total target amount in stroops (positive bigint). */
+  targetAmount?: bigint;
+  /** Optional replacement recipient addresses (must be valid Stellar addresses). */
+  recipients?: string[];
+}
+
+/**
+ * Options accepted by mutating methods to request a dry-run simulation
+ * against Soroban RPC instead of submitting a transaction (issue #844).
+ */
+export interface SimulateMutationOptions {
+  /**
+   * When `true`, the transaction is simulated and never submitted, and the
+   * method resolves with a {@link SimulationResult}.
+   * @default false
+   */
+  simulate?: boolean;
+}
+
+/**
+ * Result of a mutating client method that supports `{ simulate: true }`.
+ * Resolves with the real submission result, or a {@link SimulationResult}
+ * when simulation was requested.
+ */
+export type MaybeSimulated<T> = T | SimulationResult;
 
 /** Field names supported by read methods that can return partial objects. */
 export type InvoiceField = keyof Invoice;
@@ -2149,4 +2211,68 @@ export interface ClaimableBalanceRecord {
   claimedAt: number | null;
   /** Ledger sequence after which the predicate expires (optional). */
   predicateExpiryLedger?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Invoice Rating Types (Issue #865)
+// ---------------------------------------------------------------------------
+
+/** Creator rating information. */
+export interface CreatorRating {
+  /** Total number of ratings received by the creator. */
+  totalRatings: bigint;
+  /** Average star rating as a float (e.g. 4.3). */
+  averageStars: number;
+}
+
+// ---------------------------------------------------------------------------
+// Deadline Extension Types (Issue #864)
+// ---------------------------------------------------------------------------
+
+/** Extension status for an invoice deadline. */
+export interface ExtensionStatus {
+  /** Current number of votes for extension. */
+  voteCount: bigint;
+  /** Minimum number of votes required (quorum). */
+  quorumRequired: bigint;
+  /** Number of times the deadline has been extended. */
+  extensionCount: bigint;
+  /** Maximum allowed extensions. */
+  maxExtensions: bigint;
+  /** Current deadline timestamp. */
+  currentDeadline: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Group Management Types (Issue #863)
+// ---------------------------------------------------------------------------
+
+/** Statistics for an invoice group. */
+export interface GroupStats {
+  /** Group name. */
+  name: string;
+  /** Total target amount for all invoices in the group. */
+  totalTarget: bigint;
+  /** Total funded amount for all invoices in the group. */
+  totalFunded: bigint;
+  /** Number of invoices in the group. */
+  invoiceCount: bigint;
+  /** Number of fully funded invoices in the group. */
+  fullyFundedCount: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Attestation Types (Issue #862)
+// ---------------------------------------------------------------------------
+
+/** Invoice attestation record. */
+export interface Attestation {
+  /** Address of the attester. */
+  attester: string;
+  /** Attestation statement (max 256 chars). */
+  statement: string;
+  /** Unix timestamp when the attestation was created. */
+  timestamp: bigint;
+  /** Whether the attestation has been revoked. */
+  revoked: boolean;
 }

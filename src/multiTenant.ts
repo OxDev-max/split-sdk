@@ -1,6 +1,7 @@
 import { rpc as SorobanRpc } from "@stellar/stellar-sdk";
 import type { StellarSplitClientConfig } from "./client.js";
 import { StellarSplitClient } from "./client.js";
+import { ValidationError } from "./errors.js";
 
 // ---------------------------------------------------------------------------
 // Disposable helpers (unchanged from original)
@@ -120,7 +121,7 @@ export class MultiTenantClient {
   // on every hit so the most-recently-used entry is always at the end.
   private readonly pool = new Map<string, PoolEntry>();
 
-  private readonly clientFactory: (tenantId: string) => StellarSplitClientConfig;
+  private readonly clientFactory: ((tenantId: string) => StellarSplitClientConfig) | null;
   private readonly maxClients: number;
   private readonly ttlMs: number;
   private readonly healthCheckIntervalMs: number;
@@ -134,11 +135,35 @@ export class MultiTenantClient {
   // Background health-check timer
   private _healthTimer: ReturnType<typeof setInterval> | null = null;
 
+  /**
+   * Create a tenant pool.
+   *
+   * Two call styles are supported: pass a factory plus options (the original
+   * signature), or pass only {@link PoolOptions} and supply each tenant's config
+   * to `getClient(tenantId, config)`.
+   *
+   * @example
+   * // Options only — config comes from getClient()
+   * const pool = new MultiTenantClient({ maxClients: 50, ttlMs: 60_000 });
+   * pool.getClient("tenant-a", tenantConfig);
+   *
+   * @example
+   * // Factory + options
+   * const pool = new MultiTenantClient((id) => configFor(id), { maxClients: 50 });
+   */
   constructor(
-    clientFactory: (tenantId: string) => StellarSplitClientConfig,
+    clientFactoryOrOptions:
+      | ((tenantId: string) => StellarSplitClientConfig)
+      | PoolOptions = {},
     options: PoolOptions = {}
   ) {
-    this.clientFactory = clientFactory;
+    if (typeof clientFactoryOrOptions === "function") {
+      this.clientFactory = clientFactoryOrOptions;
+    } else {
+      this.clientFactory = null;
+      options = clientFactoryOrOptions;
+    }
+
     this.maxClients = options.maxClients ?? Infinity;
     this.ttlMs = options.ttlMs ?? Infinity;
     this.healthCheckIntervalMs = options.healthCheckIntervalMs ?? 0;
@@ -196,7 +221,15 @@ export class MultiTenantClient {
       this._evict(lruKey, lruEntry);
     }
 
-    const resolvedConfig = config ?? this.clientFactory(tenantId);
+    const resolvedConfig = config ?? this.clientFactory?.(tenantId);
+
+    if (!resolvedConfig) {
+      throw new ValidationError(
+        `No configuration available for tenant "${tenantId}". Pass a config to getClient() or a client factory to the MultiTenantClient constructor.`,
+        { tenantId }
+      );
+    }
+
     const client = new StellarSplitClient(resolvedConfig);
     const rpcUrl = Array.isArray(resolvedConfig.rpcUrl)
       ? resolvedConfig.rpcUrl[0] ?? ""

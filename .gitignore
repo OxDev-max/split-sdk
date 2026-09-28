@@ -18,17 +18,9 @@ coverage/
 .vitest/
 .nyc_output/
 test-results/
-junit.xml
-
-# Test snapshots (all formats)
-**/__snapshots__/
-*.snap
-*.snapshot
-*.snapshot.json
-testsnapshot/
-testSnapshot/
-test-snapshot/
-test-snapshots/
+.env
+.env.local
+*.env.*
 
 # Vitest cache
 .vitest-cache/
@@ -41,6 +33,27 @@ test-snapshots/
 .DS_Store
 Thumbs.db
 
+# Task / scratch files
+*.log
+task1.md
+task2.md
+task3.md
+task4.md
+somzilla.md
+
+# Test snapshots & temporary output
+**/__snapshots__/
+*.snap
+*.snapshot
+*.snapshot.json
+testsnapshot/
+testSnapshot/
+test-snapshot/
+test-snapshots/
+/tmp/
+*.profile.json
+*.speedscope.json
+
 # IDE / editor
 .vscode/
 .idea/
@@ -49,9 +62,19 @@ Thumbs.db
 *~
 
 # Logs
-*.log
 npm-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+
+# Temp files
+*.tmp
+*.temp
+
+# Size-limit cache
+.size-limit/
+
+# Vitest UI
+__vitest_browser__/
 
 # Temp / scratch files
 /tmp/
