@@ -1277,7 +1277,29 @@ export type { WaterfallConfig, WaterfallTier, WaterfallPlan, WaterfallStep } fro
 // ---------------------------------------------------------------------------
 
 export { OptimisticCache } from "./cache/OptimisticCache.js";
-export type { RollbackEvent, OptimisticEntry } from "./cache/OptimisticCache.js";
+export type {
+  OptimisticCacheOptions,
+  RevalidateErrorEvent,
+  RollbackEvent,
+  OptimisticEntry,
+} from "./cache/OptimisticCache.js";
+
+// ---------------------------------------------------------------------------
+// Split payment execution (pre-flight subentry guard + ratio validation)
+// ---------------------------------------------------------------------------
+
+export {
+  splitExecutor,
+  SPLIT_RATIO_TOLERANCE,
+  SplitRatioSumError,
+  sumRecipientRatios,
+  validateSplitRatioSum,
+} from "./payments/splitExecutor.js";
+export type {
+  SplitRecipient,
+  SplitExecutorOptions,
+  SplitExecutionResult,
+} from "./payments/splitExecutor.js";
 
 // ---------------------------------------------------------------------------
 // Typed, zero-dependency event emitter (works in Node, browser, and edge runtimes)
