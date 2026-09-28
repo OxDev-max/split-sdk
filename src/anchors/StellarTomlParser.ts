@@ -10,6 +10,21 @@
 
 // `toml` is a CommonJS package — we import it as a namespace.
 import * as toml from "toml";
+import { UnsupportedTomlVersionError } from "../errors.js";
+
+// ---------------------------------------------------------------------------
+// Supported TOML schema versions (#779)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stellar TOML schema versions that this parser accepts.
+ *
+ * Versions outside this list cause {@link StellarTomlParser.fetch} to throw
+ * an `UnsupportedTomlVersionError` before the parsed metadata is returned.
+ * This prevents silently producing incorrect data when a breaking schema
+ * revision is deployed by an anchor.
+ */
+export const SUPPORTED_TOML_VERSIONS: readonly number[] = [2.0, 2.1];
 
 // ---------------------------------------------------------------------------
 // SEP-1 typed structures
@@ -233,6 +248,16 @@ export class StellarTomlParser {
         new Error(`Failed to parse stellar.toml for domain "${domain}": ${msg}`),
         { code: "STELLAR_TOML_FETCH_ERROR", domain },
       );
+    }
+
+    // VERSION check (#779): this is the first validation after successful
+    // parsing.  When the TOML carries a VERSION field we verify it is one we
+    // support so we never silently process a breaking schema revision.
+    if (parsed["VERSION"] !== undefined) {
+      const version = Number(parsed["VERSION"]);
+      if (!SUPPORTED_TOML_VERSIONS.includes(version)) {
+        throw new UnsupportedTomlVersionError(String(parsed["VERSION"]));
+      }
     }
 
     return {

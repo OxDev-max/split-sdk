@@ -162,4 +162,90 @@ describe("PaymentGraphChecker", () => {
       expect(fetchMock).toHaveBeenCalled();
     });
   });
+
+  // -------------------------------------------------------------------------
+  // #773 — checkGraph: negative-weight edge detection
+  // -------------------------------------------------------------------------
+  describe("checkGraph() — negative-weight edge detection (#773)", () => {
+    it("returns valid:true for an empty graph", () => {
+      const result = checker.checkGraph({ edges: [] });
+      expect(result.valid).toBe(true);
+    });
+
+    it("returns valid:true when all edge weights are zero", () => {
+      const result = checker.checkGraph({
+        edges: [
+          { from: sourceAccount, to: recipientA, weight: 0 },
+          { from: recipientA, to: recipientB, weight: 0 },
+        ],
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it("returns valid:true when all edge weights are positive", () => {
+      const result = checker.checkGraph({
+        edges: [
+          { from: sourceAccount, to: recipientA, weight: 100 },
+          { from: recipientA, to: recipientB, weight: 50 },
+        ],
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it("returns valid:false when an edge has a negative weight", () => {
+      const result = checker.checkGraph({
+        edges: [
+          { from: sourceAccount, to: recipientA, weight: 100 },
+          { from: recipientA, to: recipientB, weight: -1 },
+        ],
+      });
+      expect(result.valid).toBe(false);
+    });
+
+    it("includes the offending source and target in the reason message", () => {
+      const result = checker.checkGraph({
+        edges: [
+          { from: sourceAccount, to: recipientA, weight: -5 },
+        ],
+      });
+      expect(result.valid).toBe(false);
+      expect(result.reason).toContain(sourceAccount);
+      expect(result.reason).toContain(recipientA);
+    });
+
+    it("includes the negative weight value in the reason message", () => {
+      const result = checker.checkGraph({
+        edges: [
+          { from: sourceAccount, to: recipientA, weight: -99 },
+        ],
+      });
+      expect(result.reason).toContain("-99");
+    });
+
+    it("detects the first negative-weight edge when multiple exist", () => {
+      const result = checker.checkGraph({
+        edges: [
+          { from: sourceAccount, to: recipientA, weight: 10 },
+          { from: recipientA, to: recipientB, weight: -3 },
+          { from: recipientB, to: sourceAccount, weight: -7 },
+        ],
+      });
+      expect(result.valid).toBe(false);
+      // First offending edge is recipientA → recipientB
+      expect(result.reason).toContain(recipientA);
+      expect(result.reason).toContain(recipientB);
+    });
+
+    it("allows mixed zero and positive weights", () => {
+      const result = checker.checkGraph({
+        edges: [
+          { from: sourceAccount, to: recipientA, weight: 0 },
+          { from: recipientA, to: recipientB, weight: 42 },
+          { from: recipientB, to: sourceAccount, weight: 0 },
+        ],
+      });
+      expect(result.valid).toBe(true);
+      expect(result.reason).toBeUndefined();
+    });
+  });
 });

@@ -28,6 +28,21 @@
       "types": "./dist/utils.d.ts",
       "import": "./dist/utils.js",
       "require": "./dist/utils.cjs"
+    },
+    "./mock": {
+      "types": "./dist/mock/index.d.ts",
+      "import": "./dist/mock/index.js",
+      "require": "./dist/mock/index.cjs"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js",
+      "require": "./dist/react/index.cjs"
+    },
+    "./telemetry": {
+      "types": "./dist/telemetryModule.d.ts",
+      "import": "./dist/telemetryModule.js",
+      "require": "./dist/telemetryModule.cjs"
     }
   },
   "files": [
@@ -37,14 +52,15 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest run test/client.test.ts test/retryPolicy.test.ts test/migration.test.ts",
+    "test": "vitest run test/client.test.ts test/retryPolicy.test.ts test/network-environment.test.ts",
     "test:ui": "vitest run test/ui/",
+    "test:integration": "vitest run tests/integration",
     "test:all": "vitest run",
     "test:e2e": "vitest run test/e2e",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
     "changelog": "vite-node scripts/changelog.ts",
-    "docs": "ts-node scripts/generate-docs.ts",
+    "docs": "typedoc",
     "size-audit": "tsx scripts/bundle-size-audit.ts",
     "bundle:check": "tsx scripts/bundle-size-guard.ts",
     "bundle:update-baseline": "BUNDLE_BASELINE_UPDATE=true tsx scripts/bundle-size-guard.ts"
@@ -86,6 +102,8 @@
     "ts-node": "^10.9.2",
     "tsup": "^8.5.1",
     "tsx": "^4.23.1",
+    "typedoc": "^0.26.0",
+    "typedoc-plugin-markdown": "^4.0.0",
     "typescript": "^5.9.3",
     "vitest": "^1.6.1"
   },
