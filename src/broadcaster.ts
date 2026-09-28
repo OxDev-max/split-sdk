@@ -199,3 +199,194 @@ export function createInvoiceStateBroadcaster(
 ): InvoiceStateBroadcaster {
   return new InvoiceStateBroadcaster(options);
 }
+
+/**
+ * Estimates SDK fees using historical fee observations.
+ *
+ * The estimate is derived from the provided history: the most recent
+ * observation is weighted against the historical average so that recent
+ * network conditions inform the result without discarding past data.
+ * Emits lifecycle events so callers can react to estimates and errors.
+ */
+export class FeeEstimator {
+  private history: FeeHistoryEntry[] = [];
+  private handlers: Set<FeeEstimationHandler> = new Set();
+
+  /**
+   * Subscribe to fee estimation lifecycle events.
+   *
+   * @param handler - Handler invoked on "estimate" and "error" events
+   * @returns Unsubscribe function that removes only this handler
+   */
+  on(handler: FeeEstimationHandler): () => void {
+    this.handlers.add(handler);
+    return () => {
+      this.handlers.delete(handler);
+    };
+  }
+
+  /**
+   * Record a historical fee observation.
+   *
+   * @param entry - The fee history entry to record
+   */
+  record(entry: FeeHistoryEntry): void {
+    this.history.push(entry);
+  }
+
+  /**
+   * Get a copy of the recorded fee history.
+   *
+   * @returns The recorded fee history entries
+   */
+  getHistory(): FeeHistoryEntry[] {
+    return [...this.history];
+  }
+
+  /**
+   * Estimate the current fee rate using historical analysis.
+   *
+   * @param windowSize - Optional number of most recent samples to analyze
+   * @returns The fee estimate, or null when no history is available
+   */
+  estimate(windowSize?: number): FeeEstimate | null {
+    try {
+      const samples =
+        windowSize && windowSize > 0
+          ? this.history.slice(-windowSize)
+          : this.history;
+
+      if (samples.length === 0) {
+        return null;
+      }
+
+      const rates = samples.map((entry) => entry.feeRate);
+      const minFeeRate = Math.min(...rates);
+      const maxFeeRate = Math.max(...rates);
+      const averageFeeRate =
+        rates.reduce((sum, rate) => sum + rate, 0) / rates.length;
+
+      // Weight the most recent observation against the historical average.
+      const latest = samples[samples.length - 1].feeRate;
+      const feeRate = Math.round((latest + averageFeeRate) / 2);
+
+      const estimate: FeeEstimate = {
+        feeRate,
+        minFeeRate,
+        maxFeeRate,
+        averageFeeRate,
+        sampleCount: samples.length,
+      };
+
+      this.emit("estimate", estimate);
+      return estimate;
+    } catch (error) {
+      this.emit("error", error instanceof Error ? error : new Error(String(error)));
+      return null;
+    }
+  }
+
+  private emit(event: FeeEstimationEvent, payload: FeeEstimate | Error): void {
+    this.handlers.forEach((handler) => {
+      try {
+        handler(event, payload);
+      } catch (error) {
+        console.error(`Error in fee estimation handler for ${event}:`, error);
+      }
+    });
+  }
+}
+
+/**
+ * Creates a new FeeEstimator instance.
+ *
+ * @returns A new FeeEstimator instance
+ */
+export function createFeeEstimator(): FeeEstimator {
+  return new FeeEstimator();
+}
+
+/**
+ * Optimizes payment pathways by scoring candidates on cost and reliability.
+ *
+ * Each candidate is scored so that cheaper fees and higher success
+ * probabilities rank higher. The optimizer emits lifecycle events so callers
+ * can react to optimization results and errors.
+ */
+export class PaymentPathwayOptimizer {
+  private handlers: Set<PaymentPathwayHandler> = new Set();
+
+  /**
+   * Subscribe to payment pathway optimization lifecycle events.
+   *
+   * @param handler - Handler invoked on "optimized" and "error" events
+   * @returns Unsubscribe function that removes only this handler
+   */
+  on(handler: PaymentPathwayHandler): () => void {
+    this.handlers.add(handler);
+    return () => {
+      this.handlers.delete(handler);
+    };
+  }
+
+  /**
+   * Score a single payment pathway.
+   *
+   * The score rewards higher success probability and penalizes higher fees.
+   * A zero or negative fee rate is treated as the cheapest possible pathway.
+   *
+   * @param pathway - The candidate pathway to score
+   * @returns The pathway annotated with its composite score
+   */
+  scorePathway(pathway: PaymentPathway): ScoredPaymentPathway {
+    const probability = Math.min(Math.max(pathway.successProbability, 0), 1);
+    const feeRate = pathway.feeRate > 0 ? pathway.feeRate : 1;
+    const score = probability / feeRate;
+    return { ...pathway, score };
+  }
+
+  /**
+   * Optimize a set of candidate payment pathways.
+   *
+   * @param pathways - The candidate pathways to evaluate
+   * @returns The optimization result, ordered from best to worst
+   */
+  optimize(pathways: PaymentPathway[]): PaymentPathwayOptimization {
+    try {
+      const scored = pathways
+        .map((pathway) => this.scorePathway(pathway))
+        .sort((a, b) => b.score - a.score);
+
+      const result: PaymentPathwayOptimization = {
+        pathways: scored,
+        recommended: scored.length > 0 ? scored[0] : null,
+        evaluatedCount: scored.length,
+      };
+
+      this.emit("optimized", result);
+      return result;
+    } catch (error) {
+      this.emit("error", error instanceof Error ? error : new Error(String(error)));
+      return { pathways: [], recommended: null, evaluatedCount: 0 };
+    }
+  }
+
+  private emit(event: PaymentPathwayEvent, payload: PaymentPathwayOptimization | Error): void {
+    this.handlers.forEach((handler) => {
+      try {
+        handler(event, payload);
+      } catch (error) {
+        console.error(`Error in payment pathway handler for ${event}:`, error);
+      }
+    });
+  }
+}
+
+/**
+ * Creates a new PaymentPathwayOptimizer instance.
+ *
+ * @returns A new PaymentPathwayOptimizer instance
+ */
+export function createPaymentPathwayOptimizer(): PaymentPathwayOptimizer {
+  return new PaymentPathwayOptimizer();
+}

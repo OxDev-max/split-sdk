@@ -4,8 +4,11 @@ import * as crypto from 'crypto';
 // Use node crypto webcrypto subtle
 const subtle = crypto.webcrypto.subtle;
 
+export type AuditTrailListener = (entry: AuditChainEntry) => void;
+
 export class AuditTrailHasher {
   private entries: AuditChainEntry[] = [];
+  private listeners: Set<AuditTrailListener> = new Set();
 
   constructor(entries: AuditChainEntry[] = []) {
     this.entries = [...entries];
@@ -23,6 +26,33 @@ export class AuditTrailHasher {
   }
 
   /**
+   * Subscribes to audit trail events. Returns an unsubscribe function.
+   */
+  onAppend(listener: AuditTrailListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /**
+   * Removes a previously registered audit trail listener.
+   */
+  offAppend(listener: AuditTrailListener): void {
+    this.listeners.delete(listener);
+  }
+
+  private emitAppend(entry: AuditChainEntry): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(entry);
+      } catch {
+        // Listener errors must not break the audit chain.
+      }
+    }
+  }
+
+  /**
    * Appends a new event to the audit trail
    */
   async append(event: AuditEvent): Promise<AuditChainEntry> {
@@ -35,6 +65,7 @@ export class AuditTrailHasher {
     
     const entry: AuditChainEntry = { event, hash, prevHash, index };
     this.entries.push(entry);
+    this.emitAppend(entry);
     return entry;
   }
 

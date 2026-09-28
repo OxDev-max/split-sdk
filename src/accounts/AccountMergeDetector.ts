@@ -36,9 +36,32 @@ export interface MergeEventPayload {
   mergedAt: Date;
 }
 
+/**
+ * A custody account managed by the detector. Custody accounts are watched
+ * accounts whose funds are held on behalf of a recipient and which may be
+ * merged into a destination account.
+ */
+export interface CustodyAccount {
+  /** The custody account address */
+  address: string;
+  /** Optional human-readable label */
+  label?: string;
+  /** Optional asset the custody account is expected to hold */
+  asset?: { code: string; issuer: string };
+  /** When the custody account was registered */
+  registeredAt: Date;
+}
+
+/** Payload emitted on custody account lifecycle events. */
+export interface CustodyAccountEventPayload {
+  account: CustodyAccount;
+  at: Date;
+}
+
 export class AccountMergeDetector extends EventEmitter {
   private watchedAccounts = new Set<string>();
   private mergeCache = new Map<string, string>(); // source -> destination mapping
+  private custodyAccounts = new Map<string, CustodyAccount>();
   private streamActive = false;
   private checkInterval: NodeJS.Timeout | null = null;
 
@@ -87,6 +110,72 @@ export class AccountMergeDetector extends EventEmitter {
    */
   unwatchAccount(accountId: string): void {
     this.watchedAccounts.delete(accountId);
+  }
+
+  /**
+   * Register a custody account and begin watching it for merges.
+   * Emits "custody:registered" with the created custody account.
+   */
+  registerCustodyAccount(
+    address: string,
+    options: { label?: string; asset?: { code: string; issuer: string } } = {},
+  ): CustodyAccount {
+    const existing = this.custodyAccounts.get(address);
+    if (existing) {
+      return existing;
+    }
+
+    const account: CustodyAccount = {
+      address,
+      label: options.label,
+      asset: options.asset,
+      registeredAt: new Date(),
+    };
+
+    this.custodyAccounts.set(address, account);
+    this.watchAccount(address);
+
+    this.emit("custody:registered", {
+      account,
+      at: account.registeredAt,
+    } satisfies CustodyAccountEventPayload);
+
+    return account;
+  }
+
+  /**
+   * Remove a custody account from management and stop watching it.
+   * Emits "custody:removed" when an account was actually removed.
+   */
+  removeCustodyAccount(address: string): boolean {
+    const account = this.custodyAccounts.get(address);
+    if (!account) {
+      return false;
+    }
+
+    this.custodyAccounts.delete(address);
+    this.unwatchAccount(address);
+
+    this.emit("custody:removed", {
+      account,
+      at: new Date(),
+    } satisfies CustodyAccountEventPayload);
+
+    return true;
+  }
+
+  /**
+   * Retrieve a managed custody account by address.
+   */
+  getCustodyAccount(address: string): CustodyAccount | undefined {
+    return this.custodyAccounts.get(address);
+  }
+
+  /**
+   * List all managed custody accounts.
+   */
+  listCustodyAccounts(): CustodyAccount[] {
+    return Array.from(this.custodyAccounts.values());
   }
 
   /**
@@ -199,6 +288,15 @@ export class AccountMergeDetector extends EventEmitter {
       destination: destinationAccount,
       mergedAt: event.timestamp,
     } satisfies MergeEventPayload);
+
+    // If the merged source was a managed custody account, emit a lifecycle event
+    const custodyAccount = this.custodyAccounts.get(sourceAccount);
+    if (custodyAccount) {
+      this.emit("custody:merged", {
+        account: custodyAccount,
+        at: event.timestamp,
+      } satisfies CustodyAccountEventPayload);
+    }
 
     // Notify the client to reroute recipients
     try {
