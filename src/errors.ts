@@ -2251,3 +2251,29 @@ export function isWalletConnectionTimeoutError(err: unknown): err is WalletConne
   return err instanceof WalletConnectionTimeoutError;
 }
 
+// ---------------------------------------------------------------------------
+// Batch operations errors
+// ---------------------------------------------------------------------------
+
+/** Thrown when a batch operation exceeds the maximum allowed size. */
+export class BatchTooLargeError extends StellarSplitError {
+  readonly batchSize: number;
+  readonly maxSize: number;
+
+  constructor(batchSize: number, maxSize: number = 20) {
+    super(
+      `Batch size ${batchSize} exceeds maximum of ${maxSize}`,
+      "BATCH_TOO_LARGE",
+      { batchSize, maxSize },
+    );
+    this.name = "BatchTooLargeError";
+    this.batchSize = batchSize;
+    this.maxSize = maxSize;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
+  return err instanceof BatchTooLargeError;
+}
+

@@ -23,8 +23,8 @@ export type {
   TelemetryCallEndParams,
 } from "./telemetryHooks.js";
 
-export { PluginRegistry, LoggingPlugin } from "./plugin.js";
-export type { SdkPlugin, SdkMethodName, PluginArgs, PluginResult } from "./plugin.js";
+export { PluginRegistry, LoggingPlugin, MetricsPlugin } from "./plugin.js";
+export type { SdkPlugin, SdkMethodName, PluginArgs, PluginResult, StellarSplitClientContext } from "./plugin.js";
 
 export {
   serializeInvoiceTemplate,
@@ -216,6 +216,9 @@ export {
   // Keypair format and signing validation (issue #768)
   InvalidKeypairError,
   isInvalidKeypairError,
+  // Batch operations errors (issue #855)
+  BatchTooLargeError,
+  isBatchTooLargeError,
 } from "./errors.js";
 
 // Invoice metadata JSON Schema validator (issue #533)
@@ -1226,6 +1229,31 @@ export type { RollbackEvent, OptimisticEntry } from "./cache/OptimisticCache.js"
 export { TypedEventEmitter, AbortError } from "./events/TypedEventEmitter.js";
 export type { Unsubscribe, EventMap } from "./events/TypedEventEmitter.js";
 export type { SplitClientEventMap } from "./client.js";
+
+// ---------------------------------------------------------------------------
+// SDK event bus — typed contract events (issue #856)
+// ---------------------------------------------------------------------------
+
+export type {
+  PaymentEvent,
+  ReleaseEvent,
+  RefundEvent,
+  DisputeEvent,
+  TierUnlockedEvent,
+  EventFilterOptions,
+  ContractEvent,
+} from "./contractEvents.js";
+
+// ---------------------------------------------------------------------------
+// Creator statistics (issue #854)
+// ---------------------------------------------------------------------------
+
+export type { CreatorStats } from "./creatorStats.js";
+export {
+  getCreatorStatsCache,
+  setCreatorStatsCache,
+  clearCreatorStatsCache,
+} from "./creatorStats.js";
 
 // ---------------------------------------------------------------------------
 // Multi-endpoint RPC load balancing
