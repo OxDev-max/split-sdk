@@ -666,10 +666,32 @@ export type {
 
 
 
+/**
+ * Dynamically loads the export module to perform formatting.
+ *
+ * @returns A promise that resolves to the export module.
+ * @throws {Error} Throws if the module cannot be loaded.
+ * @example
+ * ```ts
+ * const m = await getExportModule();
+ * ```
+ */
 export async function getExportModule(): Promise<typeof import("./export.js")> {
   return await import("./export.js");
 }
 
+/**
+ * Exports an invoice to the specified format.
+ *
+ * @param invoice - The invoice object to export.
+ * @param format - The target export format (e.g., CSV, JSON).
+ * @returns A promise resolving to the exported invoice string.
+ * @throws {UnknownExportFormatError} Throws if the format is not recognized.
+ * @example
+ * ```ts
+ * const csv = await exportInvoice(myInvoice, "csv");
+ * ```
+ */
 export async function exportInvoice(
   invoice: Invoice,
   format: ExportFormat,
@@ -678,10 +700,32 @@ export async function exportInvoice(
   return m.exportInvoice(invoice, format);
 }
 
+/**
+ * Dynamically loads the proof generation module.
+ *
+ * @returns A promise resolving to the proof module.
+ * @throws {Error} Throws if the proof module cannot be loaded.
+ * @example
+ * ```ts
+ * const p = await getProofModule();
+ * ```
+ */
 export async function getProofModule(): Promise<typeof import("./proof.js")> {
   return await import("./proof.js");
 }
 
+/**
+ * Generates a cryptographic payment proof for a given transaction hash.
+ *
+ * @param txHash - The transaction hash to generate a proof for.
+ * @param config - The StellarSplit client configuration.
+ * @returns A promise resolving to the generated payment proof.
+ * @throws {Error} Throws if proof generation fails.
+ * @example
+ * ```ts
+ * const proof = await generatePaymentProof("hash123", config);
+ * ```
+ */
 export async function generatePaymentProof(
   txHash: string,
   config: StellarSplitClientConfig,
