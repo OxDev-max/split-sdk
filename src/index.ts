@@ -1054,6 +1054,39 @@ export type {
 } from "./forecast.js";
 
 // ---------------------------------------------------------------------------
+// #852 — Deadline helpers
+// ---------------------------------------------------------------------------
+
+export {
+  deadlineFromDays,
+  deadlineFromDate,
+  isDeadlineValid,
+  timeUntilDeadline,
+  formatDeadline,
+} from "./deadline.js";
+export type { DeadlineRemaining } from "./deadline.js";
+
+// ---------------------------------------------------------------------------
+// #853 — Payment aggregator (multi-invoice budget allocation)
+// ---------------------------------------------------------------------------
+
+export {
+  aggregatePayments,
+  createInvoiceRemainingFetcher,
+  registerInvoiceRemainingFetcher,
+  remainingForInvoice,
+} from "./paymentAllocation.js";
+export type {
+  AggregatePaymentsOptions,
+  AmountLookup,
+  InvoiceRemainingFetcher,
+  InvoiceSource,
+  PaymentAllocation,
+  SplitStrategy,
+} from "./paymentAllocation.js";
+
+
+// ---------------------------------------------------------------------------
 // Split ratio validator
 // ---------------------------------------------------------------------------
 

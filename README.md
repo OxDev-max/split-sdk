@@ -128,7 +128,7 @@ new StellarSplitClient(config: StellarSplitClientConfig)
 
 | Class | Description |
 |-------|-------------|
-| `MultiTenantClient` | Manage a pool of `StellarSplitClient` instances keyed by tenant ID, with `getClient`, `evict`, and `evictAll` |
+| `MultiTenantClient` | Manage a pool of `StellarSplitClient` instances keyed by tenant ID, with `getClient`, `evict`, `evictAll`, `stats`, and O(1) LRU/TTL/health-check eviction. Construct with a tenant→config factory plus `{ maxClients, ttlMs, healthCheckIntervalMs }`, or with the options only and pass a config to `getClient(tenantId, config)` |
 
 ### Profiling
 
@@ -177,6 +177,60 @@ Prune stale or over-broad ledger keys from Soroban transactions before submissio
 
 See [docs/FOOTPRINT_OPTIMIZER.md](./docs/FOOTPRINT_OPTIMIZER.md).
 
+### Payment Aggregator (multi-invoice allocation)
+
+Allocate a single budget across many invoices. Choose `"equal"`, `"proportional"`
+(weighted by how far each invoice still is from its target) or `"custom"` weights
+that sum to 100. Every allocation is capped at the invoice's remaining amount, so
+overpayment is impossible.
+
+```typescript
+import { aggregatePayments, createInvoiceRemainingFetcher } from "@stellar-split/sdk";
+
+const allocations = await aggregatePayments(parseAmount("100"), [1n, 2n, 3n], "proportional", {
+  // Any object exposing getInvoice(id) works — a StellarSplitClient is ideal.
+  fetchRemaining: createInvoiceRemainingFetcher(client),
+});
+
+for (const { invoiceId, amount, percentOfBudget } of allocations) {
+  console.log(`Invoice ${invoiceId}: ${formatAmount(amount)} (${percentOfBudget}%)`);
+}
+```
+
+| Function | Description |
+|----------|-------------|
+| `aggregatePayments(budget, invoiceIds, strategy, options?)` | Compute the optimal allocation; returns one `PaymentAllocation` per invoice (`{ invoiceId, amount, percentOfBudget }`) |
+| `remainingForInvoice(invoice)` | Remaining (still unfunded) amount of an invoice, clamped at zero |
+| `createInvoiceRemainingFetcher(source)` | Build a remaining-amount fetcher from any `getInvoice(id)` source |
+| `registerInvoiceRemainingFetcher(fetcher)` | Set a process-wide fallback fetcher so `aggregatePayments` can be called without options |
+
+Behavior notes: an empty invoice list returns `[]`; duplicate invoice IDs and a
+negative budget throw `ValidationError`; `"custom"` weights must sum to 100;
+when the invoices collectively need less than the budget, the surplus stays
+unallocated and the percentages sum to less than 100.
+
+### Deadline Helpers
+
+`bigint`-based deadline helpers (Unix seconds), matching the on-chain `u64`
+representation. The legacy `number`-returning `deadlineFromDays` remains
+available from the `@stellar-split/sdk/utils` entry point.
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `deadlineFromDays(days)` | `bigint` | Unix timestamp `days` days from now (rounded up to the next whole second) |
+| `deadlineFromDate(date)` | `bigint` | Convert a `Date` to a Unix timestamp in seconds |
+| `isDeadlineValid(deadline)` | `boolean` | `true` when the deadline is at least 1 hour in the future |
+| `timeUntilDeadline(deadline)` | `DeadlineRemaining` | `{ days, hours, minutes, seconds, expired }`, all zeros once expired |
+| `formatDeadline(deadline, locale?)` | `string` | Human-readable date string, localized (rendered in UTC) |
+
+```typescript
+import { deadlineFromDays, isDeadlineValid, timeUntilDeadline } from "@stellar-split/sdk";
+
+const deadline = deadlineFromDays(7);
+isDeadlineValid(deadline);   // true
+timeUntilDeadline(deadline); // { days: 7, hours: 0, minutes: 0, seconds: 0, expired: false }
+```
+
 ### Utilities
 
 | Function | Description |
@@ -184,7 +238,7 @@ See [docs/FOOTPRINT_OPTIMIZER.md](./docs/FOOTPRINT_OPTIMIZER.md).
 | `formatAmount(stroops)` | Format stroops as USDC string (7 decimals) |
 | `parseAmount(value)` | Parse USDC string to stroops |
 | `isValidAddress(address)` | Validate a Stellar G... address |
-| `deadlineFromDays(days)` | Unix timestamp N days from now |
+| `deadlineFromDays(days)` | Unix timestamp N days from now (`number`; the root export returns a `bigint` — see [Deadline Helpers](#deadline-helpers)) |
 | `isExpired(deadline)` | Check if a deadline has passed |
 | `truncateAddress(address)` | Truncate for display: "GABC...XYZ" |
 
