@@ -8,6 +8,7 @@
 import { gzipSync } from "zlib";
 import * as fs from "fs";
 import * as path from "path";
+import { EventEmitter } from "events";
 
 interface SizeBudget {
   maxBytes: number;
@@ -23,6 +24,76 @@ interface AuditResult {
   budgetBytes: number;
   overBudget: boolean;
   percentUsed: number;
+}
+
+interface BenchmarkSample {
+  exportName: string;
+  bytes: number;
+  durationMs: number;
+}
+
+interface BenchmarkReport {
+  samples: BenchmarkSample[];
+  totalBytes: number;
+  totalDurationMs: number;
+  iterations: number;
+}
+
+/**
+ * Emits lifecycle events for the SDK performance benchmark suite.
+ * Events: "start", "iteration", "sample", "complete", "error".
+ */
+export class BenchmarkRunner extends EventEmitter {
+  private readonly iterations: number;
+
+  constructor(iterations: number = 3) {
+    super();
+    this.iterations = Math.max(1, iterations);
+  }
+
+  /**
+   * Run the benchmark across the provided export names, emitting lifecycle events.
+   */
+  run(exportNames: string[], measure: () => number): BenchmarkReport {
+    this.emit("start", { exportNames, iterations: this.iterations });
+
+    const samples: BenchmarkSample[] = [];
+    let totalBytes = 0;
+    let totalDurationMs = 0;
+
+    try {
+      for (let i = 0; i < this.iterations; i++) {
+        this.emit("iteration", { index: i, total: this.iterations });
+
+        const start = Date.now();
+        const bytes = measure();
+        const durationMs = Date.now() - start;
+
+        totalBytes += bytes;
+        totalDurationMs += durationMs;
+
+        const perExport = Math.floor(bytes / Math.max(1, exportNames.length));
+        for (const exportName of exportNames) {
+          const sample: BenchmarkSample = { exportName, bytes: perExport, durationMs };
+          samples.push(sample);
+          this.emit("sample", sample);
+        }
+      }
+
+      const report: BenchmarkReport = {
+        samples,
+        totalBytes,
+        totalDurationMs,
+        iterations: this.iterations,
+      };
+
+      this.emit("complete", report);
+      return report;
+    } catch (err) {
+      this.emit("error", err);
+      throw err;
+    }
+  }
 }
 
 /**

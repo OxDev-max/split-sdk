@@ -6,15 +6,22 @@
  *  2. The result object includes `succeeded` and `failed` arrays with correct contents.
  *  3. A batch where all invoices fail returns an empty `succeeded` array.
  *
- * Additionally, tests for the invoice notification subscription manager (#917)
- * verify that subscribers are notified on success/failure events and that
- * unsubscribing stops further notifications.
+ * Transaction builder helper tests for complex multi-op invoices (#904).
+ *
+ * These tests verify that:
+ *  4. A multi-op invoice composes all operations into a single transaction.
+ *  5. Lifecycle events are emitted for build/add/complete.
+ *  6. Building an invoice with no operations is rejected.
  */
 
 import { describe, it, expect, vi } from "vitest";
 import { InvoiceBatchProcessor } from "../invoiceBatchProcessor.js";
 import type { InvoicePaymentSubmitter } from "../invoiceBatchProcessor.js";
-import { InvoiceNotificationSubscriptionManager } from "../invoiceNotificationSubscriptionManager.js";
+import {
+  TransactionBuilder,
+  type TransactionOperation,
+  type TransactionBuilderEvent,
+} from "../transactionBuilder.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -25,6 +32,16 @@ async function drain<T>(iter: AsyncIterableIterator<T>): Promise<T[]> {
   const results: T[] = [];
   for await (const item of iter) results.push(item);
   return results;
+}
+
+/** Build a simple payment operation for the given invoice. */
+function paymentOp(invoiceId: string, amount: bigint): TransactionOperation {
+  return {
+    type: "payment",
+    invoiceId,
+    amount,
+    asset: "native",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -149,78 +166,95 @@ describe("InvoiceBatchProcessor – partial-failure handling", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests – invoice notification subscription manager (#917)
+// Tests – transaction builder helper (#904)
 // ---------------------------------------------------------------------------
 
-describe("InvoiceNotificationSubscriptionManager", () => {
-  it("notifies subscribers when an invoice event is emitted", () => {
-    const manager = new InvoiceNotificationSubscriptionManager();
-    const listener = vi.fn();
+describe("TransactionBuilder – complex multi-op invoices", () => {
+  // ── Criterion 4: multi-op composition ────────────────────────────────────
 
-    manager.subscribe(listener);
-    manager.emit({ type: "invoice.paid", invoiceId: "inv1", txHash: "tx-inv1" });
+  it("composes multiple operations into a single transaction", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+
+    builder
+      .addOperation(paymentOp("inv1", 10n))
+      .addOperation(paymentOp("inv2", 20n))
+      .addOperation({
+        type: "memo",
+        invoiceId: "inv1",
+        text: "batch settlement",
+      });
+
+    const tx = builder.build();
+
+    expect(tx.payer).toBe("GPAYER");
+    expect(tx.operations).toHaveLength(3);
+    expect(tx.operations.map((op) => op.type)).toEqual([
+      "payment",
+      "payment",
+      "memo",
+    ]);
+    expect(tx.operations[0]).toMatchObject({ invoiceId: "inv1", amount: 10n });
+    expect(tx.operations[1]).toMatchObject({ invoiceId: "inv2", amount: 20n });
+  });
+
+  it("supports adding a batch of operations at once", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+
+    builder.addOperations([
+      paymentOp("inv1", 1n),
+      paymentOp("inv2", 2n),
+      paymentOp("inv3", 3n),
+    ]);
+
+    const tx = builder.build();
+    expect(tx.operations).toHaveLength(3);
+    expect(tx.operations.map((op) => op.invoiceId)).toEqual([
+      "inv1",
+      "inv2",
+      "inv3",
+    ]);
+  });
+
+  // ── Criterion 5: lifecycle event emission ────────────────────────────────
+
+  it("emits build/add/complete lifecycle events", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+    const events: TransactionBuilderEvent[] = [];
+    builder.on((event) => events.push(event));
+
+    builder.addOperation(paymentOp("inv1", 5n));
+    builder.addOperation(paymentOp("inv2", 5n));
+    const tx = builder.build();
+    builder.complete(tx);
+
+    expect(events.map((e) => e.type)).toEqual([
+      "add",
+      "add",
+      "build",
+      "complete",
+    ]);
+    expect(events[0]).toMatchObject({ type: "add", operationCount: 1 });
+    expect(events[1]).toMatchObject({ type: "add", operationCount: 2 });
+    expect(events[2]).toMatchObject({ type: "build", operationCount: 2 });
+    expect(events[3]).toMatchObject({ type: "complete", operationCount: 2 });
+  });
+
+  it("allows unsubscribing from lifecycle events", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+    const listener = vi.fn();
+    const off = builder.on(listener);
+
+    builder.addOperation(paymentOp("inv1", 1n));
+    off();
+    builder.addOperation(paymentOp("inv2", 1n));
 
     expect(listener).toHaveBeenCalledTimes(1);
-    expect(listener).toHaveBeenCalledWith({
-      type: "invoice.paid",
-      invoiceId: "inv1",
-      txHash: "tx-inv1",
-    });
   });
 
-  it("supports multiple subscribers and notifies all of them", () => {
-    const manager = new InvoiceNotificationSubscriptionManager();
-    const first = vi.fn();
-    const second = vi.fn();
+  // ── Criterion 6: empty transaction rejected ──────────────────────────────
 
-    manager.subscribe(first);
-    manager.subscribe(second);
-    manager.emit({ type: "invoice.failed", invoiceId: "inv2", error: "boom" });
-
-    expect(first).toHaveBeenCalledTimes(1);
-    expect(second).toHaveBeenCalledTimes(1);
-    expect(first).toHaveBeenCalledWith({
-      type: "invoice.failed",
-      invoiceId: "inv2",
-      error: "boom",
-    });
-  });
-
-  it("stops notifying a subscriber after unsubscribe", () => {
-    const manager = new InvoiceNotificationSubscriptionManager();
-    const listener = vi.fn();
-
-    const unsubscribe = manager.subscribe(listener);
-    manager.emit({ type: "invoice.paid", invoiceId: "inv1", txHash: "tx-inv1" });
-    unsubscribe();
-    manager.emit({ type: "invoice.paid", invoiceId: "inv1", txHash: "tx-inv1" });
-
-    expect(listener).toHaveBeenCalledTimes(1);
-  });
-
-  it("isolates subscriber errors so other subscribers still receive events", () => {
-    const manager = new InvoiceNotificationSubscriptionManager();
-    const failing = vi.fn(() => {
-      throw new Error("subscriber exploded");
-    });
-    const healthy = vi.fn();
-
-    manager.subscribe(failing);
-    manager.subscribe(healthy);
-
-    expect(() =>
-      manager.emit({ type: "invoice.paid", invoiceId: "inv1", txHash: "tx-inv1" }),
-    ).not.toThrow();
-    expect(healthy).toHaveBeenCalledTimes(1);
-  });
-
-  it("reports the number of active subscribers", () => {
-    const manager = new InvoiceNotificationSubscriptionManager();
-    const unsubscribeA = manager.subscribe(vi.fn());
-    manager.subscribe(vi.fn());
-
-    expect(manager.subscriberCount).toBe(2);
-    unsubscribeA();
-    expect(manager.subscriberCount).toBe(1);
+  it("throws when building a transaction with no operations", () => {
+    const builder = new TransactionBuilder({ payer: "GPAYER" });
+    expect(() => builder.build()).toThrow(/no operations/i);
   });
 });

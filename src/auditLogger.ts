@@ -13,83 +13,26 @@ export interface AuditEntry {
 }
 
 /**
- * Optional analytics dashboard export payload.
+ * A single audit event emitted by the SDK for compliance tracking.
  *
- * Aggregates the audit entries observed by an {@link AuditLogger} into a
- * serializable shape suitable for an analytics dashboard. Export is opt-in:
- * it is only produced when {@link AuditLogger.exportAnalyticsDashboard} is
- * called, so default logging behavior is unchanged.
+ * Unlike {@link AuditEntry}, which is a low-level sink record, an
+ * `AuditEvent` carries a stable `type` discriminator and a monotonically
+ * increasing `sequence` so downstream consumers can order and reconcile
+ * events reliably.
  */
-export interface AnalyticsDashboardExport {
-  /** ISO timestamp of when the export was generated. */
-  generatedAt: string;
-  /** Total number of audit entries included in the export. */
-  totalEntries: number;
-  /** Number of successful entries. */
-  successCount: number;
-  /** Number of failed entries. */
-  failureCount: number;
-  /** Aggregate duration across all entries, in milliseconds. */
-  totalDurationMs: number;
-  /** Per-method breakdown of entry counts and durations. */
-  methods: Record<string, { count: number; totalDurationMs: number }>;
-  /** The raw audit entries included in the export. */
-  entries: AuditEntry[];
-}
-
-/** Lifecycle events emitted while producing an analytics dashboard export. */
-export type AnalyticsExportEvent =
-  | { type: "export_start"; entryCount: number }
-  | { type: "export_complete"; export: AnalyticsDashboardExport }
-  | { type: "export_error"; error: Error };
-
-/** Options controlling an analytics dashboard export. */
-export interface AnalyticsExportOptions {
-  /** Optional inclusive lower bound (epoch ms) on entry timestamps. */
-  since?: number;
-  /** Optional inclusive upper bound (epoch ms) on entry timestamps. */
-  until?: number;
-  /** Optional listener for export lifecycle events. */
-  onEvent?: (event: AnalyticsExportEvent) => void;
-}
-
-/**
- * A single invoice notification subscription.
- *
- * Represents a consumer's interest in receiving notifications for a given
- * invoice. Subscriptions are keyed by `invoiceId` and may be filtered by the
- * notification `events` the subscriber cares about.
- */
-export interface InvoiceNotificationSubscription {
-  /** Unique identifier for the subscription. */
-  id: string;
-  /** The invoice this subscription is bound to. */
-  invoiceId: string;
-  /** Callback invoked when a matching invoice notification is emitted. */
-  handler: (notification: InvoiceNotification) => void;
-  /** Optional subset of events to receive; when omitted, all events fire. */
-  events?: InvoiceNotificationEvent[];
-}
-
-/** Notification event types emitted for invoice lifecycle changes. */
-export type InvoiceNotificationEvent =
-  | "invoice_created"
-  | "invoice_paid"
-  | "invoice_settled"
-  | "invoice_expired"
-  | "invoice_cancelled";
-
-/** A notification payload delivered to matching invoice subscribers. */
-export interface InvoiceNotification {
-  /** The invoice the notification pertains to. */
-  invoiceId: string;
-  /** The lifecycle event that triggered the notification. */
-  event: InvoiceNotificationEvent;
-  /** Epoch ms at which the notification was emitted. */
+export interface AuditEvent {
+  /** Stable event type discriminator, e.g. `"audit.log"`. */
+  type: string;
+  /** Monotonically increasing sequence number, starting at 1. */
+  sequence: number;
+  /** Wall-clock time the event was emitted (ms since epoch). */
   timestamp: number;
-  /** Optional additional context for the notification. */
-  data?: Record<string, unknown>;
+  /** The audit entry associated with this event. */
+  entry: AuditEntry;
 }
+
+/** Handler invoked for every emitted {@link AuditEvent}. */
+export type AuditEventListener = (event: AuditEvent) => void;
 
 const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
 
@@ -102,19 +45,60 @@ const MIN_XDR_LENGTH = 40;
 export class AuditLogger {
   private readonly sink: (entry: AuditEntry) => void;
   private readonly splitAuditTrails = new Map<string, SplitAuditEntry[]>();
-  private readonly entries: AuditEntry[] = [];
-  private readonly invoiceSubscriptions = new Map<
-    string,
-    InvoiceNotificationSubscription[]
-  >();
+  private readonly listeners = new Set<AuditEventListener>();
+  private sequence = 0;
 
   constructor(sink: (entry: AuditEntry) => void) {
     this.sink = sink;
   }
 
+  /**
+   * Subscribe to audit events. Returns an unsubscribe function.
+   *
+   * Listeners are invoked synchronously after the entry has been written to
+   * the configured sink, so a throwing listener can never prevent the audit
+   * record from being persisted.
+   */
+  on(listener: AuditEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** Remove a previously registered listener. */
+  off(listener: AuditEventListener): void {
+    this.listeners.delete(listener);
+  }
+
+  /** Emit an audit event to all registered listeners. */
+  private emit(entry: AuditEntry): void {
+    if (this.listeners.size === 0) {
+      return;
+    }
+    const event: AuditEvent = {
+      type: "audit.log",
+      sequence: ++this.sequence,
+      timestamp: entry.timestamp,
+      entry,
+    };
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A misbehaving listener must never break audit logging.
+      }
+    }
+  }
+
   log(entry: AuditEntry): void {
-    this.entries.push(entry);
+    this.debugLog("log", {
+      method: entry.method,
+      success: entry.success,
+      durationMs: entry.durationMs,
+    });
     this.sink(entry);
+    this.emit(entry);
   }
 
   sanitize(params: Record<string, unknown>): Record<string, unknown> {
@@ -288,69 +272,102 @@ export class AuditLogger {
   }
 
   /**
-   * Produce an optional analytics dashboard export from the audit entries
-   * observed so far.
+   * Subscribe to cross-tenant invoice audit lifecycle events.
    *
-   * This is opt-in: nothing is exported unless this method is called, so
-   * existing default logging behavior is unaffected. Lifecycle events
-   * (`export_start`, `export_complete`, `export_error`) are emitted through
-   * `options.onEvent` when provided.
-   *
-   * @param options - Optional time-range filter and event listener.
-   * @returns A serializable {@link AnalyticsDashboardExport}.
+   * @returns an unsubscribe function.
    */
-  exportAnalyticsDashboard(
-    options: AnalyticsExportOptions = {},
-  ): AnalyticsDashboardExport {
-    const { since, until, onEvent } = options;
+  onCrossTenantAudit(listener: CrossTenantAuditEventListener): () => void {
+    this.crossTenantListeners.add(listener);
+    return () => {
+      this.crossTenantListeners.delete(listener);
+    };
+  }
 
-    const selected = this.entries.filter((entry) => {
-      if (since !== undefined && entry.timestamp < since) return false;
-      if (until !== undefined && entry.timestamp > until) return false;
-      return true;
+  /**
+   * Record a cross-tenant invoice audit entry.
+   *
+   * Persists the entry to the in-memory cross-tenant trail, writes a
+   * sanitized `AuditEntry` to the configured sink, and emits the appropriate
+   * lifecycle event:
+   * - `cross_tenant_access_detected` when the actor differs from the owner,
+   * - `cross_tenant_access_denied` when such access is unauthorized,
+   * - `invoice_audited` for every recorded entry.
+   */
+  recordCrossTenantInvoiceAudit(
+    entry: CrossTenantInvoiceAuditEntry,
+  ): void {
+    this.crossTenantAudits.push(entry);
+
+    this.log({
+      timestamp: entry.timestamp,
+      method: "cross_tenant_invoice_audit",
+      params: this.sanitize({
+        ownerTenantId: entry.ownerTenantId,
+        actorTenantId: entry.actorTenantId,
+        invoiceId: entry.invoiceId,
+        action: entry.action,
+        authorized: entry.authorized,
+        ...(entry.metadata ?? {}),
+      }),
+      success: entry.authorized,
+      durationMs: 0,
     });
 
-    onEvent?.({ type: "export_start", entryCount: selected.length });
-
-    try {
-      let successCount = 0;
-      let failureCount = 0;
-      let totalDurationMs = 0;
-      const methods: Record<string, { count: number; totalDurationMs: number }> =
-        {};
-
-      for (const entry of selected) {
-        if (entry.success) {
-          successCount += 1;
-        } else {
-          failureCount += 1;
-        }
-        totalDurationMs += entry.durationMs;
-
-        const bucket = methods[entry.method] ?? {
-          count: 0,
-          totalDurationMs: 0,
-        };
-        bucket.count += 1;
-        bucket.totalDurationMs += entry.durationMs;
-        methods[entry.method] = bucket;
+    const isCrossTenant = entry.actorTenantId !== entry.ownerTenantId;
+    if (isCrossTenant) {
+      this.emitCrossTenantAudit({
+        type: "cross_tenant_access_detected",
+        entry,
+      });
+      if (!entry.authorized) {
+        this.emitCrossTenantAudit({
+          type: "cross_tenant_access_denied",
+          entry,
+        });
       }
+    }
+    this.emitCrossTenantAudit({ type: "invoice_audited", entry });
+  }
 
-      const result: AnalyticsDashboardExport = {
-        generatedAt: new Date().toISOString(),
-        totalEntries: selected.length,
-        successCount,
-        failureCount,
-        totalDurationMs,
-        methods,
-        entries: selected.map((entry) => ({ ...entry })),
-      };
+  /**
+   * Query recorded cross-tenant invoice audit entries.
+   *
+   * All filters are optional and combined with AND semantics. Results are
+   * returned in the order they were recorded.
+   */
+  queryCrossTenantInvoiceAudits(filter?: {
+    ownerTenantId?: string;
+    actorTenantId?: string;
+    invoiceId?: string;
+    action?: string;
+    authorized?: boolean;
+  }): CrossTenantInvoiceAuditEntry[] {
+    return this.crossTenantAudits.filter((entry) => {
+      if (filter?.ownerTenantId && entry.ownerTenantId !== filter.ownerTenantId) {
+        return false;
+      }
+      if (filter?.actorTenantId && entry.actorTenantId !== filter.actorTenantId) {
+        return false;
+      }
+      if (filter?.invoiceId && entry.invoiceId !== filter.invoiceId) {
+        return false;
+      }
+      if (filter?.action && entry.action !== filter.action) {
+        return false;
+      }
+      if (
+        filter?.authorized !== undefined &&
+        entry.authorized !== filter.authorized
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }
 
-      onEvent?.({ type: "export_complete", export: result });
-      return result;
-    } catch (error) {
-      onEvent?.({ type: "export_error", error: error as Error });
-      throw error;
+  private emitCrossTenantAudit(event: CrossTenantAuditEvent): void {
+    for (const listener of this.crossTenantListeners) {
+      listener(event);
     }
   }
 }

@@ -5,7 +5,12 @@
  * invoice metadata from IPFS.
  */
 
-import type { InvoiceMetadata, IPFSConfig, LineItem } from "./types.js";
+import type {
+  CIDVerificationResult,
+  InvoiceMetadata,
+  IPFSConfig,
+  LineItem,
+} from "./types.js";
 import {
   IPFSPinError,
   IPFSFetchError,
@@ -84,16 +89,154 @@ export function deserializeMetadata(json: string): InvoiceMetadata {
   };
 }
 
-/**
- * Compute a simple hash of content for CID verification.
- * Uses SHA-256 and returns a hex string.
- */
-async function computeContentHash(content: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(content);
+// ---------------------------------------------------------------------------
+// CID computation
+//
+// A CID is a self-describing content address: it embeds the multihash of the
+// content it names. Verification therefore means *recomputing* the CID from
+// the bytes and comparing it to the CID that was requested — comparing content
+// against content would only prove the fetch round-tripped, not that the bytes
+// actually hash to the address being claimed.
+//
+// Both common versions are supported:
+// - CIDv0: `base58btc(0x12 0x20 || sha256(content))` — the classic `Qm...`
+// - CIDv1: `base32(0x01 0x70 0x12 0x20 || sha256(content))` — the `bafy...` form
+// ---------------------------------------------------------------------------
+
+/** Multicodec prefix for `sha2-256`, the hash IPFS uses for file blocks. */
+const SHA256_MULTIHASH_PREFIX = new Uint8Array([0x12, 0x20]);
+
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+
+/** SHA-256 digest of `content`. */
+async function sha256(content: string): Promise<Uint8Array> {
+  const data = new TextEncoder().encode(content);
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  return new Uint8Array(hashBuffer);
+}
+
+/**
+ * Encode bytes in base58btc — the multibase used by CIDv0.
+ *
+ * Implemented directly rather than pulled from a dependency so the SDK's
+ * dependency surface stays unchanged.
+ */
+function encodeBase58(bytes: Uint8Array): string {
+  if (bytes.length === 0) return "";
+
+  // Count leading zero bytes; each encodes as a literal "1".
+  let zeros = 0;
+  while (zeros < bytes.length && bytes[zeros] === 0) zeros++;
+
+  // Repeatedly divide the big-endian number by 58, collecting remainders.
+  const digits: number[] = [];
+  const buffer = Array.from(bytes);
+  let start = zeros;
+  while (start < buffer.length) {
+    let remainder = 0;
+    for (let i = start; i < buffer.length; i++) {
+      // accumulator = remainder * 256 + byte, kept below 2^53 to stay exact.
+      const accumulator = remainder * 256 + (buffer[i] as number);
+      (buffer[i] as number) = Math.floor(accumulator / 58);
+      remainder = accumulator % 58;
+    }
+    digits.push(remainder);
+    while (start < buffer.length && (buffer[start] as number) === 0) start++;
+  }
+
+  let out = "1".repeat(zeros);
+  for (let i = digits.length - 1; i >= 0; i--) {
+    out += BASE58_ALPHABET[digits[i] as number];
+  }
+  return out;
+}
+
+/** Encode bytes in unpadded lowercase base32 — the multibase used by CIDv1. */
+function encodeBase32(bytes: Uint8Array): string {
+  let bits = 0;
+  let value = 0;
+  let out = "";
+
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    out += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  return out;
+}
+
+/** Build the multihash for `content` under sha2-256. */
+async function multihash(content: string): Promise<Uint8Array> {
+  const digest = await sha256(content);
+  const out = new Uint8Array(SHA256_MULTIHASH_PREFIX.length + digest.length);
+  out.set(SHA256_MULTIHASH_PREFIX, 0);
+  out.set(digest, SHA256_MULTIHASH_PREFIX.length);
+  return out;
+}
+
+/** Compute the CIDv0 (`Qm...`) for `content`. */
+export async function computeCidV0(content: string): Promise<string> {
+  return encodeBase58(await multihash(content));
+}
+
+/** Compute the CIDv1 (`bafy...`, dag-pb, sha2-256) for `content`. */
+export async function computeCidV1(content: string): Promise<string> {
+  const body = await multihash(content);
+  // varint codec 0x01 (dag-pb) + varint multihash code 0x12 + varint length 0x20
+  const out = new Uint8Array(4 + body.length);
+  out.set([0x01, 0x70, 0x12, 0x20], 0);
+  out.set(body, 4);
+  // "b" is the multibase prefix identifying base32lower-encoded CIDs.
+  return `b${encodeBase32(out)}`;
+}
+
+/**
+ * Normalise content to the exact bytes that were (or would be) pinned.
+ *
+ * Objects are serialised as JSON. This must match {@link serializeMetadata}
+ * exactly, since the CID returned by `pinInvoiceMetadata` addresses those
+ * bytes.
+ */
+function normalizeContent(content: unknown): string {
+  return typeof content === "string" ? content : JSON.stringify(content);
+}
+
+/**
+ * Strip incidental differences from a CID before comparing.
+ *
+ * CIDs are often written with an `ipfs://` URI scheme or a `/ipfs/` path
+ * segment; both name the same address as the bare form.
+ */
+function normalizeCid(cid: string): string {
+  return cid
+    .trim()
+    .replace(/^ipfs:\/\//i, "")
+    .replace(/^\//, "")
+    .replace(/\/ipfs\//i, "/");
+}
+
+/**
+ * Compute the CID of `content` in the same version as `cid`.
+ *
+ * Comparing within the requested version matters: a CIDv0 and CIDv1 name the
+ * same bytes, so verifying one against the other would always fail.
+ */
+async function computeCidForVersion(
+  content: string,
+  cid: string,
+): Promise<string> {
+  const normalized = cid.trim();
+  // CIDv1 base32 always begins "b"; CIDv0 base58btc always begins "Qm".
+  return normalized.startsWith("b")
+    ? computeCidV1(content)
+    : computeCidV0(content);
 }
 
 /**
@@ -369,36 +512,76 @@ async function fetchViaGateway(cid: string, cfg: IPFSConfig): Promise<string> {
 }
 
 /**
- * Verify that content matches a CID by fetching and comparing hashes.
+ * Verify that content matches a CID.
  *
- * Since we can't recompute the exact CID without the multihash library,
- * this function fetches the content from IPFS and compares it with the
- * provided content by computing SHA-256 hashes of both.
+ * A CID is a self-describing content address, so verification means
+ * recomputing it from the bytes and comparing. When `content` is supplied the
+ * check is purely local — no network round-trip — and proves the bytes really
+ * do hash to the address being claimed. Omit `content` to fetch the bytes by
+ * CID and verify those instead.
  *
  * @param cid - The CID to verify.
- * @param content - The expected content (object or string).
+ * @param content - The expected content (object or string). Omit to verify
+ *   whatever the CID resolves to.
  * @param config - Optional IPFS configuration override.
- * @returns True if the content matches, false otherwise.
- * @throws {IPFSFetchError} If fetching the CID content fails.
+ * @returns True if the content hashes to the CID, false otherwise.
+ * @throws {IPFSFetchError} If `content` is omitted and the fetch fails.
  */
 export async function verifyCID(
   cid: string,
-  content: unknown,
-  config?: Partial<IPFSConfig>
+  content?: unknown,
+  config?: Partial<IPFSConfig>,
 ): Promise<boolean> {
-  const fetchedContent = await fetchFromIPFS(cid, config);
+  const source =
+    content === undefined || content === null
+      ? await fetchFromIPFS(cid, config)
+      : normalizeContent(content);
 
-  // Normalize content to string for comparison
-  const expectedContent =
-    typeof content === "string" ? content : JSON.stringify(content);
-
-  // Compare by computing hashes
-  const fetchedHash = await computeContentHash(fetchedContent);
-  const expectedHash = await computeContentHash(expectedContent);
-
-  return fetchedHash === expectedHash;
+  const computed = await computeCidForVersion(source, cid);
+  return computed === normalizeCid(cid);
 }
 
+/**
+ * Verify `cid` against `content` and return a structured result.
+ *
+ * Prefer this over {@link verifyCID} when you need to know *which* address the
+ * content actually produces — for example to log the real CID when a mismatch
+ * is detected.
+ *
+ * @param cid - The CID to verify.
+ * @param content - The expected content. Omit to verify the fetched bytes.
+ * @param config - Optional IPFS configuration override.
+ * @returns A {@link CIDVerificationResult} describing the outcome. Errors are
+ *   reported as `valid: false` rather than thrown.
+ */
+export async function verifyCIDDetailed(
+  cid: string,
+  content?: unknown,
+  config?: Partial<IPFSConfig>,
+): Promise<CIDVerificationResult> {
+  try {
+    const source =
+      content === undefined || content === null
+        ? await fetchFromIPFS(cid, config)
+        : normalizeContent(content);
+
+    const computed = await computeCidForVersion(source, cid);
+    const valid = computed === normalizeCid(cid);
+
+    return {
+      valid,
+      expectedCID: cid,
+      computedCID: computed,
+      ...(valid ? {} : { error: `Content does not match CID ${cid}` }),
+    };
+  } catch (error) {
+    return {
+      valid: false,
+      expectedCID: cid,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
 /**
  * Verify CID and throw CIDMismatchError if content doesn't match.
  *
@@ -410,12 +593,14 @@ export async function verifyCID(
  */
 export async function verifyCIDOrThrow(
   cid: string,
-  content: unknown,
-  config?: Partial<IPFSConfig>
+  content?: unknown,
+  config?: Partial<IPFSConfig>,
 ): Promise<void> {
-  const isValid = await verifyCID(cid, content, config);
-  if (!isValid) {
-    throw new CIDMismatchError(cid);
+  const result = await verifyCIDDetailed(cid, content, config);
+  if (!result.valid) {
+    // Surface the CID the content actually produces — without it, a mismatch
+    // gives the caller no way to tell a wrong CID from wrong bytes.
+    throw new CIDMismatchError(cid, result.computedCID);
   }
 }
 

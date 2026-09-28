@@ -1,5 +1,8 @@
 /**
- * @stellar-split/sdk — public API (core exports)
+ * SDK entry point.
+ *
+ * Exposes the public surface of the SDK along with a lightweight caching
+ * layer that supports per-entry TTLs and explicit invalidation.
  */
 
 import type { Invoice } from "./types.js";
@@ -16,6 +19,15 @@ export type {
   StellarSplitPlugin,
 } from "./client.js";
 
+export {
+  NetworkEnvironment,
+  NETWORK_PRESETS,
+  isNetworkPreset,
+  getNetworkPreset,
+  detectNetworkEnvironment,
+} from "./config.js";
+export type { NetworkPreset } from "./config.js";
+
 export type {
   TelemetryHooks,
   TelemetryErrorContext,
@@ -23,8 +35,8 @@ export type {
   TelemetryCallEndParams,
 } from "./telemetryHooks.js";
 
-export { PluginRegistry, LoggingPlugin } from "./plugin.js";
-export type { SdkPlugin, SdkMethodName, PluginArgs, PluginResult } from "./plugin.js";
+export { PluginRegistry, LoggingPlugin, MetricsPlugin } from "./plugin.js";
+export type { SdkPlugin, SdkMethodName, PluginArgs, PluginResult, StellarSplitClientContext } from "./plugin.js";
 
 export {
   serializeInvoiceTemplate,
@@ -105,6 +117,10 @@ export {
   PathRouterError,
   OfferTrackingError,
   ClaimableBalanceLifecycleError,
+  InvoiceFullyFundedError,
+  isInvoiceFullyFundedError,
+  DelegateLimitReachedError,
+  isDelegateLimitReachedError,
   isInvoiceNotFoundError,
   isInvoiceNotPendingError,
   isDeadlinePassedError,
@@ -174,6 +190,8 @@ export {
   isRequestTimeoutError,
   AdminOperationError,
   isAdminOperationError,
+  NetworkMismatchError,
+  isNetworkMismatchError,
   CommitmentGenerationError,
   isCommitmentGenerationError,
   BlindingFactorStorageError,
@@ -216,6 +234,9 @@ export {
   // Keypair format and signing validation (issue #768)
   InvalidKeypairError,
   isInvalidKeypairError,
+  // Batch operations errors (issue #855)
+  BatchTooLargeError,
+  isBatchTooLargeError,
 } from "./errors.js";
 
 // Invoice metadata JSON Schema validator (issue #533)
@@ -263,6 +284,9 @@ export {
   pinInvoiceMetadata,
   verifyCID,
   verifyCIDOrThrow,
+  verifyCIDDetailed,
+  computeCidV0,
+  computeCidV1,
   fetchFromIPFS,
   fetchInvoiceMetadata,
   parseIPFSCid,
@@ -586,6 +610,13 @@ export type {
   Subscription,
   SubscriptionOptions,
   SubscriptionLifecycleEvent,
+  // Issue #844 — dry-run simulation surface
+  SimulationResult,
+  LedgerFootprint,
+  SimulateMutationOptions,
+  MaybeSimulated,
+  // Issue #850 — clone field overrides
+  InvoiceParamOverrides,
   // New: AMM Calculator
   PoolSwapEstimate,
   PoolShareResult,
@@ -627,6 +658,10 @@ export type {
   WebhookPayload,
   WebhookRequest,
   RequestHandler,
+  WebhookMiddleware,
+  WebhookEventMap,
+  WebhookEventContext,
+  WebhookEventEmitter,
   InvoiceCreatedData,
   InvoicePaidData,
   InvoiceReleasedData,
@@ -641,10 +676,32 @@ export type {
 
 
 
+/**
+ * Dynamically loads the export module to perform formatting.
+ *
+ * @returns A promise that resolves to the export module.
+ * @throws {Error} Throws if the module cannot be loaded.
+ * @example
+ * ```ts
+ * const m = await getExportModule();
+ * ```
+ */
 export async function getExportModule(): Promise<typeof import("./export.js")> {
   return await import("./export.js");
 }
 
+/**
+ * Exports an invoice to the specified format.
+ *
+ * @param invoice - The invoice object to export.
+ * @param format - The target export format (e.g., CSV, JSON).
+ * @returns A promise resolving to the exported invoice string.
+ * @throws {UnknownExportFormatError} Throws if the format is not recognized.
+ * @example
+ * ```ts
+ * const csv = await exportInvoice(myInvoice, "csv");
+ * ```
+ */
 export async function exportInvoice(
   invoice: Invoice,
   format: ExportFormat,
@@ -653,10 +710,32 @@ export async function exportInvoice(
   return m.exportInvoice(invoice, format);
 }
 
+/**
+ * Dynamically loads the proof generation module.
+ *
+ * @returns A promise resolving to the proof module.
+ * @throws {Error} Throws if the proof module cannot be loaded.
+ * @example
+ * ```ts
+ * const p = await getProofModule();
+ * ```
+ */
 export async function getProofModule(): Promise<typeof import("./proof.js")> {
   return await import("./proof.js");
 }
 
+/**
+ * Generates a cryptographic payment proof for a given transaction hash.
+ *
+ * @param txHash - The transaction hash to generate a proof for.
+ * @param config - The StellarSplit client configuration.
+ * @returns A promise resolving to the generated payment proof.
+ * @throws {Error} Throws if proof generation fails.
+ * @example
+ * ```ts
+ * const proof = await generatePaymentProof("hash123", config);
+ * ```
+ */
 export async function generatePaymentProof(
   txHash: string,
   config: StellarSplitClientConfig,
@@ -724,7 +803,10 @@ export { SimulationSandbox } from "./sandbox/SimulationSandbox.js";
 export type {
   SandboxClient,
   SimulationCost,
-  SimulationResult,
+  // The sandbox result type is re-exported under an unambiguous alias so it
+  // does not collide with the RPC `SimulationResult` (issue #844) exported
+  // from `./types.js` above.
+  SimulationResult as SandboxSimulationResult,
   SandboxInvoiceRecord,
   SandboxPaymentRecord,
   SandboxCallLogEntry,
@@ -831,6 +913,17 @@ export type { ReminderSchedule, ReminderEvent, ReminderStatus } from "./types.js
 export { compileFilter, applyFilter, FilterIndex } from "./invoiceFilter.js";
 export type { FilterCriteria, CompiledFilter } from "./invoiceFilter.js";
 
+// Invoice query engine — filter/sort/paginate invoices with one typed query
+export {
+  InvoiceQueryEngine,
+  InvoiceTagIndex,
+  queryInvoices,
+  getInvoiceTags,
+  INVOICE_SORTS,
+  DEFAULT_QUERY_LIMIT,
+} from "./invoiceQuery.js";
+export type { InvoiceFilter, InvoicePage, InvoiceSort } from "./invoiceQuery.js";
+
 // Invoice diff utility
 export { diffInvoices, hasDiff } from "./diff.js";
 export type { InvoiceDiff, InvoiceDiffEntry } from "./diff.js";
@@ -849,6 +942,15 @@ export type {
 export { trackVelocity } from "./velocityTracker.js";
 export type { VelocityReport, InvoiceVelocity, PaymentTrend } from "./velocityTracker.js";
 export type { VelocityStatus, VelocityWindowStatus } from "./types.js";
+
+// Issue #866 — Pause/Resume invoice
+export type { PauseStatus } from "./types.js";
+
+// Issue #867 — Pledge matching
+export type { MatchPledge } from "./types.js";
+
+// Issue #868 — Streaming payments
+export type { Stream } from "./types.js";
 
 // Tranche release progress tracking
 export { getTrancheProgress } from "./trancheProgress.js";
@@ -1025,6 +1127,39 @@ export type {
   ForecastConfig,
   HistoricalInvoiceSample,
 } from "./forecast.js";
+
+// ---------------------------------------------------------------------------
+// #852 — Deadline helpers
+// ---------------------------------------------------------------------------
+
+export {
+  deadlineFromDays,
+  deadlineFromDate,
+  isDeadlineValid,
+  timeUntilDeadline,
+  formatDeadline,
+} from "./deadline.js";
+export type { DeadlineRemaining } from "./deadline.js";
+
+// ---------------------------------------------------------------------------
+// #853 — Payment aggregator (multi-invoice budget allocation)
+// ---------------------------------------------------------------------------
+
+export {
+  aggregatePayments,
+  createInvoiceRemainingFetcher,
+  registerInvoiceRemainingFetcher,
+  remainingForInvoice,
+} from "./paymentAllocation.js";
+export type {
+  AggregatePaymentsOptions,
+  AmountLookup,
+  InvoiceRemainingFetcher,
+  InvoiceSource,
+  PaymentAllocation,
+  SplitStrategy,
+} from "./paymentAllocation.js";
+
 
 // ---------------------------------------------------------------------------
 // Split ratio validator
@@ -1217,7 +1352,29 @@ export type { WaterfallConfig, WaterfallTier, WaterfallPlan, WaterfallStep } fro
 // ---------------------------------------------------------------------------
 
 export { OptimisticCache } from "./cache/OptimisticCache.js";
-export type { RollbackEvent, OptimisticEntry } from "./cache/OptimisticCache.js";
+export type {
+  OptimisticCacheOptions,
+  RevalidateErrorEvent,
+  RollbackEvent,
+  OptimisticEntry,
+} from "./cache/OptimisticCache.js";
+
+// ---------------------------------------------------------------------------
+// Split payment execution (pre-flight subentry guard + ratio validation)
+// ---------------------------------------------------------------------------
+
+export {
+  splitExecutor,
+  SPLIT_RATIO_TOLERANCE,
+  SplitRatioSumError,
+  sumRecipientRatios,
+  validateSplitRatioSum,
+} from "./payments/splitExecutor.js";
+export type {
+  SplitRecipient,
+  SplitExecutorOptions,
+  SplitExecutionResult,
+} from "./payments/splitExecutor.js";
 
 // ---------------------------------------------------------------------------
 // Typed, zero-dependency event emitter (works in Node, browser, and edge runtimes)
@@ -1226,6 +1383,31 @@ export type { RollbackEvent, OptimisticEntry } from "./cache/OptimisticCache.js"
 export { TypedEventEmitter, AbortError } from "./events/TypedEventEmitter.js";
 export type { Unsubscribe, EventMap } from "./events/TypedEventEmitter.js";
 export type { SplitClientEventMap } from "./client.js";
+
+// ---------------------------------------------------------------------------
+// SDK event bus — typed contract events (issue #856)
+// ---------------------------------------------------------------------------
+
+export type {
+  PaymentEvent,
+  ReleaseEvent,
+  RefundEvent,
+  DisputeEvent,
+  TierUnlockedEvent,
+  EventFilterOptions,
+  ContractEvent,
+} from "./contractEvents.js";
+
+// ---------------------------------------------------------------------------
+// Creator statistics (issue #854)
+// ---------------------------------------------------------------------------
+
+export type { CreatorStats } from "./creatorStats.js";
+export {
+  getCreatorStatsCache,
+  setCreatorStatsCache,
+  clearCreatorStatsCache,
+} from "./creatorStats.js";
 
 // ---------------------------------------------------------------------------
 // Multi-endpoint RPC load balancing
@@ -1427,3 +1609,50 @@ export type {
   SubmitTransactionOptions,
   SubmitServer,
 } from "./transaction/submit.js";
+
+// Request queue with priority lanes
+export { RequestQueue } from "./requestQueue.js";
+export type { PriorityLane, QueuedRequest, QueueStats } from "./requestQueue.js";
+
+// Invoice history retrieval and parsing
+export { getInvoiceHistory, getHistoryPage, parseHistoryEvent } from "./invoiceHistory.js";
+export type {
+  HistoryEntry,
+  HistoryEventType,
+  HistoryPage,
+  HistoryPageOptions,
+  PaymentHistoryEntry,
+  ReleaseHistoryEntry,
+  RefundHistoryEntry,
+  NoteHistoryEntry,
+  PauseHistoryEntry,
+  ResumeHistoryEntry,
+  CancelHistoryEntry,
+  FreezeHistoryEntry,
+  UnfreezeHistoryEntry,
+} from "./types/invoiceHistory.js";
+
+// Template management
+export {
+  saveTemplate,
+  createFromTemplate,
+  deleteTemplate,
+  getTemplate,
+  listTemplates,
+  TemplateNotFoundError,
+  TemplateAccessDeniedError,
+} from "./templates.js";
+export type { InvoiceTemplate, CreateFromTemplateParams, SaveTemplateParams } from "./types/templates.js";
+
+// Recurring subscriptions
+export {
+  createSubscription,
+  triggerSubscription,
+  pauseSubscription,
+  resumeSubscription,
+  getSubscription,
+  cancelSubscription,
+  SubscriptionNotFoundError,
+  TooEarlyToTriggerError,
+} from "./subscriptions.js";
+export type { Subscription, SubscriptionStatus, CreateSubscriptionParams } from "./types/subscriptions.js";

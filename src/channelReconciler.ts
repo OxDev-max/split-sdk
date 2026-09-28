@@ -38,6 +38,37 @@ export type ChannelStateFetcher = (
   payer: string
 ) => Promise<ChannelState>;
 
+/** Lifecycle events emitted during invoice reconciliation. */
+export type ReconciliationEvent =
+  | { type: "reconciliation:started"; invoiceId: string; payer: string }
+  | { type: "reconciliation:matched"; invoiceId: string; payer: string; result: ChannelReconciliationResult }
+  | { type: "reconciliation:discrepancy"; invoiceId: string; payer: string; result: ChannelReconciliationResult }
+  | { type: "reconciliation:completed"; invoiceId: string; payer: string; result: ChannelReconciliationResult }
+  | { type: "reconciliation:error"; invoiceId: string; payer: string; error: unknown };
+
+/** Listener invoked for every reconciliation lifecycle event. */
+export type ReconciliationEventListener = (event: ReconciliationEvent) => void;
+
+const _listeners = new Set<ReconciliationEventListener>();
+
+/**
+ * Subscribe to reconciliation lifecycle events.
+ *
+ * @returns An unsubscribe function that removes the listener.
+ */
+export function onReconciliationEvent(listener: ReconciliationEventListener): () => void {
+  _listeners.add(listener);
+  return () => {
+    _listeners.delete(listener);
+  };
+}
+
+function emit(event: ReconciliationEvent): void {
+  for (const listener of _listeners) {
+    listener(event);
+  }
+}
+
 let _fetcher: ChannelStateFetcher | null = null;
 
 /** Register (or clear) the function that reads on-chain channel state. */
@@ -64,23 +95,39 @@ export async function reconcileChannel(
   localPayments: bigint[],
   fetcher?: ChannelStateFetcher
 ): Promise<ChannelReconciliationResult> {
-  const resolveFetcher = fetcher ?? _fetcher;
-  if (!resolveFetcher) {
-    throw new ChannelReconciliationError(
-      "No channel state fetcher registered. Call registerChannelStateFetcher() first."
-    );
+  emit({ type: "reconciliation:started", invoiceId, payer });
+
+  try {
+    const resolveFetcher = fetcher ?? _fetcher;
+    if (!resolveFetcher) {
+      throw new ChannelReconciliationError(
+        "No channel state fetcher registered. Call registerChannelStateFetcher() first."
+      );
+    }
+
+    const { deposited, balance: onChainBalance } = await resolveFetcher(invoiceId, payer);
+
+    const totalPaid = localPayments.reduce((sum, amt) => sum + amt, 0n);
+    const expectedBalance = deposited - totalPaid;
+    const delta = onChainBalance - expectedBalance;
+
+    const result: ChannelReconciliationResult = {
+      inSync: delta === 0n,
+      onChainBalance,
+      expectedBalance,
+      delta,
+    };
+
+    if (result.inSync) {
+      emit({ type: "reconciliation:matched", invoiceId, payer, result });
+    } else {
+      emit({ type: "reconciliation:discrepancy", invoiceId, payer, result });
+    }
+
+    emit({ type: "reconciliation:completed", invoiceId, payer, result });
+    return result;
+  } catch (error) {
+    emit({ type: "reconciliation:error", invoiceId, payer, error });
+    throw error;
   }
-
-  const { deposited, balance: onChainBalance } = await resolveFetcher(invoiceId, payer);
-
-  const totalPaid = localPayments.reduce((sum, amt) => sum + amt, 0n);
-  const expectedBalance = deposited - totalPaid;
-  const delta = onChainBalance - expectedBalance;
-
-  return {
-    inSync: delta === 0n,
-    onChainBalance,
-    expectedBalance,
-    delta,
-  };
 }
