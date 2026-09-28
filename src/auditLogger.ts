@@ -12,40 +12,27 @@ export interface AuditEntry {
   decodedXdr?: DecodedXDR;
 }
 
-/** Lifecycle states for a custody withdrawal approval workflow. */
-export type WithdrawalApprovalStatus =
-  | "pending"
-  | "approved"
-  | "rejected"
-  | "executed";
-
-/** A single approval decision recorded by an approver. */
-export interface WithdrawalApprovalDecision {
-  approverId: string;
-  approved: boolean;
-  decidedAt: number;
-  reason?: string;
+/**
+ * A single audit event emitted by the SDK for compliance tracking.
+ *
+ * Unlike {@link AuditEntry}, which is a low-level sink record, an
+ * `AuditEvent` carries a stable `type` discriminator and a monotonically
+ * increasing `sequence` so downstream consumers can order and reconcile
+ * events reliably.
+ */
+export interface AuditEvent {
+  /** Stable event type discriminator, e.g. `"audit.log"`. */
+  type: string;
+  /** Monotonically increasing sequence number, starting at 1. */
+  sequence: number;
+  /** Wall-clock time the event was emitted (ms since epoch). */
+  timestamp: number;
+  /** The audit entry associated with this event. */
+  entry: AuditEntry;
 }
 
-/** A custody withdrawal request tracked through its approval lifecycle. */
-export interface WithdrawalApprovalRequest {
-  requestId: string;
-  accountId: string;
-  assetCode: string;
-  amount: string;
-  requiredApprovals: number;
-  status: WithdrawalApprovalStatus;
-  submittedAt: number;
-  decisions: WithdrawalApprovalDecision[];
-  executedAt?: number;
-}
-
-/** Events emitted as a withdrawal approval workflow progresses. */
-export type WithdrawalApprovalEvent =
-  | { type: "submitted"; request: WithdrawalApprovalRequest }
-  | { type: "approved"; request: WithdrawalApprovalRequest; decision: WithdrawalApprovalDecision }
-  | { type: "rejected"; request: WithdrawalApprovalRequest; decision: WithdrawalApprovalDecision }
-  | { type: "executed"; request: WithdrawalApprovalRequest };
+/** Handler invoked for every emitted {@link AuditEvent}. */
+export type AuditEventListener = (event: AuditEvent) => void;
 
 const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
 
@@ -58,17 +45,60 @@ const MIN_XDR_LENGTH = 40;
 export class AuditLogger {
   private readonly sink: (entry: AuditEntry) => void;
   private readonly splitAuditTrails = new Map<string, SplitAuditEntry[]>();
-  private readonly withdrawalRequests = new Map<string, WithdrawalApprovalRequest>();
-  private readonly withdrawalListeners = new Set<
-    (event: WithdrawalApprovalEvent) => void
-  >();
+  private readonly listeners = new Set<AuditEventListener>();
+  private sequence = 0;
 
   constructor(sink: (entry: AuditEntry) => void) {
     this.sink = sink;
   }
 
+  /**
+   * Subscribe to audit events. Returns an unsubscribe function.
+   *
+   * Listeners are invoked synchronously after the entry has been written to
+   * the configured sink, so a throwing listener can never prevent the audit
+   * record from being persisted.
+   */
+  on(listener: AuditEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** Remove a previously registered listener. */
+  off(listener: AuditEventListener): void {
+    this.listeners.delete(listener);
+  }
+
+  /** Emit an audit event to all registered listeners. */
+  private emit(entry: AuditEntry): void {
+    if (this.listeners.size === 0) {
+      return;
+    }
+    const event: AuditEvent = {
+      type: "audit.log",
+      sequence: ++this.sequence,
+      timestamp: entry.timestamp,
+      entry,
+    };
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A misbehaving listener must never break audit logging.
+      }
+    }
+  }
+
   log(entry: AuditEntry): void {
+    this.debugLog("log", {
+      method: entry.method,
+      success: entry.success,
+      durationMs: entry.durationMs,
+    });
     this.sink(entry);
+    this.emit(entry);
   }
 
   sanitize(params: Record<string, unknown>): Record<string, unknown> {
@@ -179,173 +209,102 @@ export class AuditLogger {
   }
 
   /**
-   * Subscribe to withdrawal approval lifecycle events. Returns an unsubscribe
-   * function.
+   * Subscribe to cross-tenant invoice audit lifecycle events.
+   *
+   * @returns an unsubscribe function.
    */
-  onWithdrawalApprovalEvent(
-    listener: (event: WithdrawalApprovalEvent) => void,
-  ): () => void {
-    this.withdrawalListeners.add(listener);
-    return () => this.withdrawalListeners.delete(listener);
+  onCrossTenantAudit(listener: CrossTenantAuditEventListener): () => void {
+    this.crossTenantListeners.add(listener);
+    return () => {
+      this.crossTenantListeners.delete(listener);
+    };
   }
 
-  private emitWithdrawalEvent(event: WithdrawalApprovalEvent): void {
-    for (const listener of this.withdrawalListeners) {
+  /**
+   * Record a cross-tenant invoice audit entry.
+   *
+   * Persists the entry to the in-memory cross-tenant trail, writes a
+   * sanitized `AuditEntry` to the configured sink, and emits the appropriate
+   * lifecycle event:
+   * - `cross_tenant_access_detected` when the actor differs from the owner,
+   * - `cross_tenant_access_denied` when such access is unauthorized,
+   * - `invoice_audited` for every recorded entry.
+   */
+  recordCrossTenantInvoiceAudit(
+    entry: CrossTenantInvoiceAuditEntry,
+  ): void {
+    this.crossTenantAudits.push(entry);
+
+    this.log({
+      timestamp: entry.timestamp,
+      method: "cross_tenant_invoice_audit",
+      params: this.sanitize({
+        ownerTenantId: entry.ownerTenantId,
+        actorTenantId: entry.actorTenantId,
+        invoiceId: entry.invoiceId,
+        action: entry.action,
+        authorized: entry.authorized,
+        ...(entry.metadata ?? {}),
+      }),
+      success: entry.authorized,
+      durationMs: 0,
+    });
+
+    const isCrossTenant = entry.actorTenantId !== entry.ownerTenantId;
+    if (isCrossTenant) {
+      this.emitCrossTenantAudit({
+        type: "cross_tenant_access_detected",
+        entry,
+      });
+      if (!entry.authorized) {
+        this.emitCrossTenantAudit({
+          type: "cross_tenant_access_denied",
+          entry,
+        });
+      }
+    }
+    this.emitCrossTenantAudit({ type: "invoice_audited", entry });
+  }
+
+  /**
+   * Query recorded cross-tenant invoice audit entries.
+   *
+   * All filters are optional and combined with AND semantics. Results are
+   * returned in the order they were recorded.
+   */
+  queryCrossTenantInvoiceAudits(filter?: {
+    ownerTenantId?: string;
+    actorTenantId?: string;
+    invoiceId?: string;
+    action?: string;
+    authorized?: boolean;
+  }): CrossTenantInvoiceAuditEntry[] {
+    return this.crossTenantAudits.filter((entry) => {
+      if (filter?.ownerTenantId && entry.ownerTenantId !== filter.ownerTenantId) {
+        return false;
+      }
+      if (filter?.actorTenantId && entry.actorTenantId !== filter.actorTenantId) {
+        return false;
+      }
+      if (filter?.invoiceId && entry.invoiceId !== filter.invoiceId) {
+        return false;
+      }
+      if (filter?.action && entry.action !== filter.action) {
+        return false;
+      }
+      if (
+        filter?.authorized !== undefined &&
+        entry.authorized !== filter.authorized
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }
+
+  private emitCrossTenantAudit(event: CrossTenantAuditEvent): void {
+    for (const listener of this.crossTenantListeners) {
       listener(event);
     }
-  }
-
-  /**
-   * Submit a new custody withdrawal request, entering the `pending` state.
-   * Emits a `submitted` event and writes an audit entry.
-   */
-  submitWithdrawalRequest(params: {
-    requestId: string;
-    accountId: string;
-    assetCode: string;
-    amount: string;
-    requiredApprovals: number;
-  }): WithdrawalApprovalRequest {
-    if (this.withdrawalRequests.has(params.requestId)) {
-      throw new Error(
-        `Withdrawal request ${params.requestId} already exists`,
-      );
-    }
-    if (params.requiredApprovals < 1) {
-      throw new Error("requiredApprovals must be at least 1");
-    }
-
-    const request: WithdrawalApprovalRequest = {
-      requestId: params.requestId,
-      accountId: params.accountId,
-      assetCode: params.assetCode,
-      amount: params.amount,
-      requiredApprovals: params.requiredApprovals,
-      status: "pending",
-      submittedAt: Date.now(),
-      decisions: [],
-    };
-
-    this.withdrawalRequests.set(request.requestId, request);
-    this.log({
-      timestamp: request.submittedAt,
-      method: "withdrawal_submitted",
-      params: this.sanitize({
-        requestId: request.requestId,
-        accountId: request.accountId,
-        assetCode: request.assetCode,
-        amount: request.amount,
-        requiredApprovals: request.requiredApprovals,
-      }),
-      success: true,
-      durationMs: 0,
-    });
-    this.emitWithdrawalEvent({ type: "submitted", request });
-    return request;
-  }
-
-  /**
-   * Record an approver's decision. Once the number of approvals reaches
-   * `requiredApprovals`, the request transitions to `approved`. A single
-   * rejection transitions the request to `rejected`. Decisions on a request
-   * that is no longer `pending` are rejected.
-   */
-  recordWithdrawalDecision(params: {
-    requestId: string;
-    approverId: string;
-    approved: boolean;
-    reason?: string;
-  }): WithdrawalApprovalRequest {
-    const request = this.withdrawalRequests.get(params.requestId);
-    if (!request) {
-      throw new Error(`Unknown withdrawal request ${params.requestId}`);
-    }
-    if (request.status !== "pending") {
-      throw new Error(
-        `Withdrawal request ${params.requestId} is not pending (status: ${request.status})`,
-      );
-    }
-    if (request.decisions.some((d) => d.approverId === params.approverId)) {
-      throw new Error(
-        `Approver ${params.approverId} already decided on ${params.requestId}`,
-      );
-    }
-
-    const decision: WithdrawalApprovalDecision = {
-      approverId: params.approverId,
-      approved: params.approved,
-      decidedAt: Date.now(),
-      reason: params.reason,
-    };
-    request.decisions.push(decision);
-
-    if (!decision.approved) {
-      request.status = "rejected";
-    } else if (
-      request.decisions.filter((d) => d.approved).length >=
-      request.requiredApprovals
-    ) {
-      request.status = "approved";
-    }
-
-    this.log({
-      timestamp: decision.decidedAt,
-      method: decision.approved
-        ? "withdrawal_approved"
-        : "withdrawal_rejected",
-      params: this.sanitize({
-        requestId: request.requestId,
-        approverId: decision.approverId,
-        reason: decision.reason ?? "",
-        status: request.status,
-      }),
-      success: true,
-      durationMs: 0,
-    });
-    this.emitWithdrawalEvent({
-      type: decision.approved ? "approved" : "rejected",
-      request,
-      decision,
-    });
-    return request;
-  }
-
-  /**
-   * Execute an approved withdrawal request. Only requests in the `approved`
-   * state may be executed; this transitions them to `executed`.
-   */
-  executeWithdrawalRequest(requestId: string): WithdrawalApprovalRequest {
-    const request = this.withdrawalRequests.get(requestId);
-    if (!request) {
-      throw new Error(`Unknown withdrawal request ${requestId}`);
-    }
-    if (request.status !== "approved") {
-      throw new Error(
-        `Withdrawal request ${requestId} cannot be executed (status: ${request.status})`,
-      );
-    }
-
-    request.status = "executed";
-    request.executedAt = Date.now();
-
-    this.log({
-      timestamp: request.executedAt,
-      method: "withdrawal_executed",
-      params: this.sanitize({
-        requestId: request.requestId,
-        accountId: request.accountId,
-        assetCode: request.assetCode,
-        amount: request.amount,
-      }),
-      success: true,
-      durationMs: 0,
-    });
-    this.emitWithdrawalEvent({ type: "executed", request });
-    return request;
-  }
-
-  /** Return the current state of a withdrawal approval request. */
-  getWithdrawalRequest(requestId: string): WithdrawalApprovalRequest | undefined {
-    return this.withdrawalRequests.get(requestId);
   }
 }

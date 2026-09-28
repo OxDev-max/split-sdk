@@ -42,6 +42,13 @@ export interface WaterfallTier {
   minimumAmount: bigint;
   /** Asset for this tier. Defaults to the invoice's token when omitted. */
   asset?: Asset;
+  /**
+   * Optional routing preference score for this tier (higher = tried first).
+   * Tiers are sorted by `score` descending before the waterfall runs; ties keep
+   * their declaration order. Defaults to `0` when omitted, so an unscored
+   * config preserves its declared priority order exactly.
+   */
+  score?: number;
 }
 
 /** Ordered recipient tiers with minimum amounts, plus overflow behavior. */

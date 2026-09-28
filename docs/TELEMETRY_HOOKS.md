@@ -1,6 +1,7 @@
 # SDK Telemetry Hooks
 
 > **Issue #362**: Add opt-in telemetry hooks for error and performance monitoring
+> **Issue #903**: Add SDK metrics export in Prometheus format
 
 ## Overview
 
@@ -17,6 +18,7 @@ All hooks are **fire-and-forget** — exceptions within hooks do not propagate t
 - ✅ Full TypeScript type safety
 - ✅ Zero dependencies
 - ✅ Opt-in (no performance impact when not configured)
+- ✅ Prometheus-format metrics export (see [Prometheus Metrics Export](#prometheus-metrics-export))
 
 ## Installation
 
@@ -60,6 +62,88 @@ client.setTelemetryHooks({
 
 ```typescript
 client.clearTelemetryHooks();
+```
+
+## Prometheus Metrics Export
+
+> **Issue #903**: Add SDK metrics export in Prometheus format
+
+The SDK can export the metrics it collects through the telemetry hooks in the
+[Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/),
+so they can be scraped by a Prometheus server or any compatible agent.
+
+### Enabling Metrics Collection
+
+Metrics are collected from the same `onCallStart` / `onCallEnd` / `onError`
+events used by the telemetry hooks. Register the built-in metrics collector to
+start recording them:
+
+```typescript
+import { createPrometheusMetrics } from "@stellar-split/sdk";
+
+const metrics = createPrometheusMetrics();
+
+client.setTelemetryHooks({
+  onError: metrics.onError,
+  onCallStart: metrics.onCallStart,
+  onCallEnd: metrics.onCallEnd,
+});
+```
+
+### Exposing the Metrics Endpoint
+
+Call `metrics.export()` to obtain the current snapshot rendered in Prometheus
+text format. Serve it from any HTTP handler (Express, Fastify, a serverless
+function, etc.):
+
+```typescript
+import express from "express";
+
+const app = express();
+
+app.get("/metrics", (_req, res) => {
+  res.set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+  res.send(metrics.export());
+});
+
+app.listen(9464);
+```
+
+### Exported Metrics
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `stellar_split_sdk_calls_total` | counter | `method`, `success` | Total number of SDK calls, split by outcome |
+| `stellar_split_sdk_call_duration_seconds` | histogram | `method` | Duration of SDK calls in seconds |
+| `stellar_split_sdk_errors_total` | counter | `method` | Total number of SDK errors |
+| `stellar_split_sdk_in_flight_calls` | gauge | `method` | SDK calls currently in progress |
+
+Example output:
+
+```
+# HELP stellar_split_sdk_calls_total Total number of SDK calls.
+# TYPE stellar_split_sdk_calls_total counter
+stellar_split_sdk_calls_total{method="createInvoice",success="true"} 12
+stellar_split_sdk_calls_total{method="createInvoice",success="false"} 1
+# HELP stellar_split_sdk_call_duration_seconds Duration of SDK calls in seconds.
+# TYPE stellar_split_sdk_call_duration_seconds histogram
+stellar_split_sdk_call_duration_seconds_bucket{method="createInvoice",le="0.1"} 8
+stellar_split_sdk_call_duration_seconds_bucket{method="createInvoice",le="0.5"} 12
+stellar_split_sdk_call_duration_seconds_bucket{method="createInvoice",le="+Inf"} 13
+stellar_split_sdk_call_duration_seconds_sum{method="createInvoice"} 1.842
+stellar_split_sdk_call_duration_seconds_count{method="createInvoice"} 13
+# HELP stellar_split_sdk_errors_total Total number of SDK errors.
+# TYPE stellar_split_sdk_errors_total counter
+stellar_split_sdk_errors_total{method="createInvoice"} 1
+# HELP stellar_split_sdk_in_flight_calls SDK calls currently in progress.
+# TYPE stellar_split_sdk_in_flight_calls gauge
+stellar_split_sdk_in_flight_calls{method="createInvoice"} 0
+```
+
+### Resetting Metrics
+
+```typescript
+metrics.reset();
 ```
 
 ## Hook Signatures
@@ -308,112 +392,4 @@ Console output:
 
 - **Zero overhead when not configured**: Hooks have no performance impact when not registered
 - **Minimal overhead when configured**: Hook execution is synchronous and fast
-- **Fire-and-forget**: Hook errors never block SDK operations
-- **No memory leaks**: Hooks are properly cleaned up when cleared
-
-## TypeScript Support
-
-All hook types are fully typed for IDE autocomplete and type safety:
-
-```typescript
-import type {
-  TelemetryHooks,
-  TelemetryErrorContext,
-  TelemetryCallStartParams,
-  TelemetryCallEndParams,
-} from "@stellar-split/sdk";
-
-const hooks: TelemetryHooks = {
-  onError: (error, context) => {
-    // `error` is typed as StellarSplitError
-    // `context` is typed as TelemetryErrorContext
-    console.log(error.code, context.method);
-  },
-  onCallStart: (params) => {
-    // `params` is typed as TelemetryCallStartParams
-    console.log(params.method, params.timestamp);
-  },
-  onCallEnd: (params) => {
-    // `params` is typed as TelemetryCallEndParams
-    console.log(params.success, params.durationMs);
-  },
-};
-```
-
-## Best Practices
-
-1. **Keep hooks lightweight**: Avoid heavy computation in hooks
-2. **Use async operations carefully**: If you need to make async calls, don't await them in hooks
-3. **Handle hook errors gracefully**: Expect hooks to fail occasionally (network issues, etc.)
-4. **Sanitize sensitive data**: The SDK provides basic sanitization, but you may want additional filtering
-5. **Test your hooks**: Ensure your monitoring code doesn't introduce bugs
-
-## Troubleshooting
-
-### Hook not being called
-
-Ensure the hook is registered before making SDK calls:
-
-```typescript
-client.setTelemetryHooks({ onError });
-await client.createInvoice(params); // Hook will be called
-```
-
-### Hook exceptions appearing in console
-
-This is expected fire-and-forget behavior. Fix the exception in your hook code:
-
-```typescript
-client.setTelemetryHooks({
-  onError: (error, context) => {
-    try {
-      // Your monitoring code
-      sendToSentry(error);
-    } catch (err) {
-      // Handle gracefully
-      console.warn("Failed to send error to Sentry:", err);
-    }
-  },
-});
-```
-
-## Migration Guide
-
-If you were using custom error handling before:
-
-```typescript
-// Before
-try {
-  await client.createInvoice(params);
-} catch (error) {
-  trackError(error);
-  throw error;
-}
-```
-
-```typescript
-// After
-client.setTelemetryHooks({
-  onError: (error, context) => trackError(error, context),
-});
-
-await client.createInvoice(params); // Error tracking happens automatically
-```
-
-## API Reference
-
-### `client.setTelemetryHooks(hooks: TelemetryHooks): void`
-
-Register telemetry hooks. Replaces any previously registered hooks.
-
-### `client.clearTelemetryHooks(): void`
-
-Remove all registered telemetry hooks.
-
-## Related Issues
-
-- [#362: Add SDK telemetry hooks for error and performance monitoring](https://github.com/Stellar-split/split-sdk/issues/362)
-
-## License
-
-MIT
+- **Fire-and-forget**: Hook errors

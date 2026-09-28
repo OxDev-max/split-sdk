@@ -13,19 +13,85 @@ export interface ApprovalWorkflowOptions {
   applySignatures?: SignatureApplier;
 }
 
-export type WithdrawalApprovalState =
-  | "pending"
-  | "approved"
-  | "rejected"
-  | "executed"
-  | "expired";
+export interface PaymentForwardingRule {
+  id: string;
+  /** Optional source account filter; matches any source when omitted. */
+  source?: string;
+  /** Optional destination account filter; matches any destination when omitted. */
+  destination?: string;
+  /** Optional asset code filter; matches any asset when omitted. */
+  assetCode?: string;
+  /** Optional inclusive minimum amount filter. */
+  minAmount?: number;
+  /** Optional inclusive maximum amount filter. */
+  maxAmount?: number;
+  /** Account that receives the forwarded payment. */
+  forwardTo: string;
+}
 
-export interface WithdrawalApprovalResult {
-  state: WithdrawalApprovalState;
-  weight: number;
-  threshold: number;
-  approvals: number;
-  rejections: number;
+export interface PaymentForwardingRequest {
+  source: string;
+  destination: string;
+  assetCode: string;
+  amount: number;
+}
+
+export interface PaymentForwardingDecision {
+  forwarded: boolean;
+  ruleId?: string;
+  forwardTo?: string;
+}
+
+export class PaymentForwardingRulesEngine {
+  private readonly rules: PaymentForwardingRule[] = [];
+
+  constructor(rules: readonly PaymentForwardingRule[] = []) {
+    for (const rule of rules) {
+      this.addRule(rule);
+    }
+  }
+
+  addRule(rule: PaymentForwardingRule): void {
+    if (!rule.id) {
+      throw new Error("Payment forwarding rule requires an id");
+    }
+    if (!rule.forwardTo) {
+      throw new Error(`Payment forwarding rule requires a forwardTo account: ${rule.id}`);
+    }
+    this.rules.push(rule);
+    emitSdkEvent("paymentForwardingRuleAdded", { ruleId: rule.id });
+  }
+
+  getRules(): readonly PaymentForwardingRule[] {
+    return this.rules;
+  }
+
+  evaluate(request: PaymentForwardingRequest): PaymentForwardingDecision {
+    const rule = this.rules.find((candidate) => this.matches(candidate, request));
+    if (!rule) {
+      emitSdkEvent("paymentForwardingSkipped", {
+        source: request.source,
+        destination: request.destination,
+      });
+      return { forwarded: false };
+    }
+
+    emitSdkEvent("paymentForwarded", {
+      ruleId: rule.id,
+      forwardTo: rule.forwardTo,
+      amount: request.amount,
+    });
+    return { forwarded: true, ruleId: rule.id, forwardTo: rule.forwardTo };
+  }
+
+  private matches(rule: PaymentForwardingRule, request: PaymentForwardingRequest): boolean {
+    if (rule.source !== undefined && rule.source !== request.source) return false;
+    if (rule.destination !== undefined && rule.destination !== request.destination) return false;
+    if (rule.assetCode !== undefined && rule.assetCode !== request.assetCode) return false;
+    if (rule.minAmount !== undefined && request.amount < rule.minAmount) return false;
+    if (rule.maxAmount !== undefined && request.amount > rule.maxAmount) return false;
+    return true;
+  }
 }
 
 export class ApprovalSession {
