@@ -13,45 +13,26 @@ export interface AuditEntry {
 }
 
 /**
- * A single cross-tenant invoice audit record.
+ * A single audit event emitted by the SDK for compliance tracking.
  *
- * Captures which tenant performed an action against an invoice owned by
- * another tenant, so cross-tenant access can be recorded, queried, and
- * verified after the fact.
+ * Unlike {@link AuditEntry}, which is a low-level sink record, an
+ * `AuditEvent` carries a stable `type` discriminator and a monotonically
+ * increasing `sequence` so downstream consumers can order and reconcile
+ * events reliably.
  */
-export interface CrossTenantInvoiceAuditEntry {
-  /** Tenant that owns the invoice being acted upon. */
-  ownerTenantId: string;
-  /** Tenant that performed the action. */
-  actorTenantId: string;
-  /** Invoice the action targeted. */
-  invoiceId: string;
-  /** Action performed (e.g. "read", "settle", "refund"). */
-  action: string;
-  /** Whether the cross-tenant access was authorized. */
-  authorized: boolean;
-  /** When the action occurred (epoch ms). */
+export interface AuditEvent {
+  /** Stable event type discriminator, e.g. `"audit.log"`. */
+  type: string;
+  /** Monotonically increasing sequence number, starting at 1. */
+  sequence: number;
+  /** Wall-clock time the event was emitted (ms since epoch). */
   timestamp: number;
-  /** Optional free-form context for the action. */
-  metadata?: Record<string, unknown>;
+  /** The audit entry associated with this event. */
+  entry: AuditEntry;
 }
 
-/** Lifecycle events emitted by the cross-tenant invoice auditor. */
-export type CrossTenantAuditEvent =
-  | { type: "invoice_audited"; entry: CrossTenantInvoiceAuditEntry }
-  | { type: "cross_tenant_access_detected"; entry: CrossTenantInvoiceAuditEntry }
-  | { type: "cross_tenant_access_denied"; entry: CrossTenantInvoiceAuditEntry };
-
-export type CrossTenantAuditEventListener = (
-  event: CrossTenantAuditEvent,
-) => void;
-
-/** Lifecycle events emitted when SDK debug mode is toggled. */
-export type DebugModeEvent =
-  | { type: "debug_mode_enabled" }
-  | { type: "debug_mode_disabled" };
-
-export type DebugModeEventListener = (event: DebugModeEvent) => void;
+/** Handler invoked for every emitted {@link AuditEvent}. */
+export type AuditEventListener = (event: AuditEvent) => void;
 
 const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
 
@@ -64,62 +45,49 @@ const MIN_XDR_LENGTH = 40;
 export class AuditLogger {
   private readonly sink: (entry: AuditEntry) => void;
   private readonly splitAuditTrails = new Map<string, SplitAuditEntry[]>();
-  private readonly crossTenantAudits: CrossTenantInvoiceAuditEntry[] = [];
-  private readonly crossTenantListeners = new Set<CrossTenantAuditEventListener>();
-  private readonly debugListeners = new Set<DebugModeEventListener>();
-  private debugEnabled = false;
+  private readonly listeners = new Set<AuditEventListener>();
+  private sequence = 0;
 
   constructor(sink: (entry: AuditEntry) => void) {
     this.sink = sink;
   }
 
   /**
-   * Enable or disable SDK debug mode.
+   * Subscribe to audit events. Returns an unsubscribe function.
    *
-   * When enabled, verbose diagnostic output is written for every audit
-   * operation. Toggling emits a `debug_mode_enabled` / `debug_mode_disabled`
-   * event to all subscribers registered via {@link onDebugModeChange}.
+   * Listeners are invoked synchronously after the entry has been written to
+   * the configured sink, so a throwing listener can never prevent the audit
+   * record from being persisted.
    */
-  setDebugMode(enabled: boolean): void {
-    if (this.debugEnabled === enabled) {
-      return;
-    }
-    this.debugEnabled = enabled;
-    this.emitDebugMode({
-      type: enabled ? "debug_mode_enabled" : "debug_mode_disabled",
-    });
-  }
-
-  /** Whether SDK debug mode is currently enabled. */
-  isDebugModeEnabled(): boolean {
-    return this.debugEnabled;
-  }
-
-  /**
-   * Subscribe to debug mode state changes.
-   *
-   * @returns an unsubscribe function.
-   */
-  onDebugModeChange(listener: DebugModeEventListener): () => void {
-    this.debugListeners.add(listener);
+  on(listener: AuditEventListener): () => void {
+    this.listeners.add(listener);
     return () => {
-      this.debugListeners.delete(listener);
+      this.listeners.delete(listener);
     };
   }
 
-  /** Emit a verbose debug log line when debug mode is enabled. */
-  private debugLog(message: string, context?: Record<string, unknown>): void {
-    if (!this.debugEnabled) {
-      return;
-    }
-    const suffix = context ? ` ${JSON.stringify(context)}` : "";
-    // eslint-disable-next-line no-console
-    console.debug(`[AuditLogger] ${message}${suffix}`);
+  /** Remove a previously registered listener. */
+  off(listener: AuditEventListener): void {
+    this.listeners.delete(listener);
   }
 
-  private emitDebugMode(event: DebugModeEvent): void {
-    for (const listener of this.debugListeners) {
-      listener(event);
+  /** Emit an audit event to all registered listeners. */
+  private emit(entry: AuditEntry): void {
+    if (this.listeners.size === 0) {
+      return;
+    }
+    const event: AuditEvent = {
+      type: "audit.log",
+      sequence: ++this.sequence,
+      timestamp: entry.timestamp,
+      entry,
+    };
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A misbehaving listener must never break audit logging.
+      }
     }
   }
 
@@ -130,6 +98,7 @@ export class AuditLogger {
       durationMs: entry.durationMs,
     });
     this.sink(entry);
+    this.emit(entry);
   }
 
   sanitize(params: Record<string, unknown>): Record<string, unknown> {

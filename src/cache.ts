@@ -18,73 +18,15 @@ export interface MethodCacheEntry {
   expiresAt: number;
 }
 
-/**
- * SDK debug mode configuration.
- *
- * When enabled, cache operations emit verbose log lines through the
- * configured logger so integrators can trace cache hits, misses, writes,
- * evictions and invalidations.
- */
-export interface DebugModeOptions {
-  enabled?: boolean;
-  logger?: (message: string, ...args: any[]) => void;
+export type CacheEventType = "set" | "hit" | "miss" | "expire" | "invalidate" | "evict";
+
+export interface CacheEvent {
+  type: CacheEventType;
+  key: string;
+  timestamp: number;
 }
 
-/**
- * Shared debug-mode state used by the cache implementations.
- *
- * Emits `debug:change` events whenever the enabled flag flips so consumers
- * can react to debug mode being toggled at runtime.
- */
-export class DebugMode {
-  private enabled: boolean;
-  private readonly logger: (message: string, ...args: any[]) => void;
-  private readonly listeners = new Set<(enabled: boolean) => void>();
-
-  constructor(options?: DebugModeOptions) {
-    this.enabled = options?.enabled ?? false;
-    this.logger = options?.logger ?? ((message: string, ...args: any[]) => console.debug(message, ...args));
-  }
-
-  /** Whether verbose logging is currently active. */
-  get isEnabled(): boolean {
-    return this.enabled;
-  }
-
-  /** Enable or disable debug mode, emitting a change event on transitions. */
-  setEnabled(enabled: boolean): void {
-    if (this.enabled === enabled) return;
-    this.enabled = enabled;
-    for (const listener of this.listeners) {
-      listener(enabled);
-    }
-  }
-
-  enable(): void {
-    this.setEnabled(true);
-  }
-
-  disable(): void {
-    this.setEnabled(false);
-  }
-
-  /**
-   * Register a listener invoked with the new state whenever debug mode
-   * changes. Returns an unsubscribe function.
-   */
-  onChange(listener: (enabled: boolean) => void): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
-  }
-
-  /** Emit a verbose log line when debug mode is enabled. */
-  log(message: string, ...args: any[]): void {
-    if (!this.enabled) return;
-    this.logger(message, ...args);
-  }
-}
+export type CacheEventListener = (event: CacheEvent) => void;
 
 export class SimpleCache<T> {
   private readonly store = new Map<string, MethodCacheEntry>();
@@ -94,7 +36,7 @@ export class SimpleCache<T> {
   private misses = 0;
   private evictions = 0;
   private maxEntries: number;
-  private readonly debug: DebugMode;
+  private readonly listeners = new Set<CacheEventListener>();
 
   constructor(config?: number | { enabled?: boolean; ttl?: Record<string, number>; ttlMs?: number; maxEntries?: number; debug?: boolean | DebugModeOptions }) {
     if (typeof config === "number") {
@@ -123,18 +65,38 @@ export class SimpleCache<T> {
     return this.debug;
   }
 
+  /**
+   * Subscribe to cache lifecycle events (set, hit, miss, expire, invalidate,
+   * evict).  Returns an unsubscribe function.
+   */
+  on(listener: CacheEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emit(type: CacheEventType, key: string): void {
+    if (this.listeners.size === 0) return;
+    const event: CacheEvent = { type, key, timestamp: Date.now() };
+    for (const listener of this.listeners) {
+      listener(event);
+    }
+  }
+
   get(key: string): T | undefined {
     if (!this.enabled) return undefined;
     const entry = this.store.get(key);
     if (!entry) {
       this.misses++;
-      this.debug.log(`[cache] miss ${key}`);
+      this.emit("miss", key);
       return undefined;
     }
     if (Date.now() > entry.expiresAt) {
       this.store.delete(key);
       this.misses++;
-      this.debug.log(`[cache] expired ${key}`);
+      this.emit("expire", key);
+      this.emit("miss", key);
       return undefined;
     }
     
@@ -143,7 +105,7 @@ export class SimpleCache<T> {
     this.store.set(key, entry);
 
     this.hits++;
-    this.debug.log(`[cache] hit ${key}`);
+    this.emit("hit", key);
     return entry.value;
   }
 
@@ -158,30 +120,35 @@ export class SimpleCache<T> {
       if (oldestKey !== undefined) {
         this.store.delete(oldestKey);
         this.evictions++;
-        this.debug.log(`[cache] evict ${oldestKey}`);
+        this.emit("evict", oldestKey);
       }
     }
 
     this.store.set(key, { value, expiresAt: Date.now() + ttl });
-    this.debug.log(`[cache] set ${key} (ttl=${ttl}ms)`);
+    this.emit("set", key);
   }
 
   invalidate(methodOrKey?: string, args?: any[]): void {
     if (!methodOrKey) {
+      const keys = Array.from(this.store.keys());
       this.store.clear();
-      this.debug.log("[cache] invalidate all");
+      for (const key of keys) {
+        this.emit("invalidate", key);
+      }
       return;
     }
     if (args) {
       const key = `${methodOrKey}:${JSON.stringify(args)}`;
-      this.store.delete(key);
-      this.debug.log(`[cache] invalidate ${key}`);
+      if (this.store.delete(key)) {
+        this.emit("invalidate", key);
+      }
       return;
     }
     
     // Check if it's an exact key
     if (this.store.has(methodOrKey)) {
       this.store.delete(methodOrKey);
+      this.emit("invalidate", methodOrKey);
     }
     
     // Invalidate by method prefix
@@ -189,6 +156,7 @@ export class SimpleCache<T> {
     for (const key of this.store.keys()) {
       if (key.startsWith(prefix)) {
         this.store.delete(key);
+        this.emit("invalidate", key);
       }
     }
     this.debug.log(`[cache] invalidate ${methodOrKey}`);
@@ -204,6 +172,7 @@ export class SimpleCache<T> {
     for (const [key, entry] of this.store.entries()) {
       if (now > entry.expiresAt) {
         this.store.delete(key);
+        this.emit("expire", key);
       }
     }
     return {
@@ -253,7 +222,7 @@ interface CacheEntry<V> {
 export class Cache<V> {
   private readonly store = new Map<string, CacheEntry<V>>();
   private readonly ttlMs: number | undefined;
-  private readonly debug: DebugMode;
+  private readonly listeners = new Set<CacheEventListener>();
 
   /**
    * @param ttlMs  Time-to-live in milliseconds.  Omit (or pass `undefined`)
@@ -273,11 +242,30 @@ export class Cache<V> {
   }
 
   /**
+   * Subscribe to cache lifecycle events (set, hit, miss, expire, invalidate).
+   * Returns an unsubscribe function.
+   */
+  on(listener: CacheEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emit(type: CacheEventType, key: string): void {
+    if (this.listeners.size === 0) return;
+    const event: CacheEvent = { type, key, timestamp: Date.now() };
+    for (const listener of this.listeners) {
+      listener(event);
+    }
+  }
+
+  /**
    * Store `value` under `key`, recording the current wall-clock time.
    */
   set(key: string, value: V): void {
     this.store.set(key, { value, writtenAt: Date.now() });
-    this.debug.log(`[cache] set ${key}`);
+    this.emit("set", key);
   }
 
   /**
@@ -290,15 +278,16 @@ export class Cache<V> {
   get(key: string): V | undefined {
     const entry = this.store.get(key);
     if (!entry) {
-      this.debug.log(`[cache] miss ${key}`);
+      this.emit("miss", key);
       return undefined;
     }
     if (this.isExpired(entry)) {
       this.store.delete(key);
-      this.debug.log(`[cache] expired ${key}`);
+      this.emit("expire", key);
+      this.emit("miss", key);
       return undefined;
     }
-    this.debug.log(`[cache] hit ${key}`);
+    this.emit("hit", key);
     return entry.value;
   }
 
@@ -311,6 +300,7 @@ export class Cache<V> {
     if (!entry) return false;
     if (this.isExpired(entry)) {
       this.store.delete(key);
+      this.emit("expire", key);
       return false;
     }
     return true;
@@ -325,20 +315,25 @@ export class Cache<V> {
     for (const [key, entry] of this.store) {
       if (this.isExpired(entry)) {
         this.store.delete(key);
+        this.emit("expire", key);
       }
     }
   }
 
   /** Remove a specific entry by key. */
   delete(key: string): void {
-    this.store.delete(key);
-    this.debug.log(`[cache] delete ${key}`);
+    if (this.store.delete(key)) {
+      this.emit("invalidate", key);
+    }
   }
 
   /** Remove all entries. */
   clear(): void {
+    const keys = Array.from(this.store.keys());
     this.store.clear();
-    this.debug.log("[cache] clear");
+    for (const key of keys) {
+      this.emit("invalidate", key);
+    }
   }
 
   /** Number of entries currently in the store (including not-yet-evicted expired ones). */
@@ -351,5 +346,138 @@ export class Cache<V> {
   private isExpired(entry: CacheEntry<V>): boolean {
     if (this.ttlMs === undefined) return false;
     return Date.now() - entry.writtenAt > this.ttlMs;
+  }
+}
+
+/**
+ * Outcome of a nonce deduplication check.
+ */
+export type NonceDedupOutcome = "accepted" | "duplicate";
+
+/**
+ * Event payload emitted for every nonce deduplication decision.
+ */
+export interface NonceDedupEvent {
+  /** The nonce that was evaluated. */
+  nonce: string;
+  /** Whether the request was accepted (first-seen) or rejected as a duplicate. */
+  outcome: NonceDedupOutcome;
+  /** Unix ms timestamp of the decision. */
+  timestamp: number;
+}
+
+/**
+ * Listener invoked whenever a nonce deduplication decision is made.
+ */
+export type NonceDedupListener = (event: NonceDedupEvent) => void;
+
+/**
+ * Configuration for {@link NonceDeduplicator}.
+ *
+ * Deduplication is **opt-in**: when `enabled` is omitted or `false` the
+ * deduplicator is a transparent pass-through and every nonce is accepted,
+ * preserving existing behaviour.
+ */
+export interface NonceDeduplicatorConfig {
+  /** Enable deduplication. Defaults to `false` (pass-through). */
+  enabled?: boolean;
+  /** Time-to-live in ms for a seen nonce. Defaults to 300_000 (5 minutes). */
+  ttlMs?: number;
+  /** Maximum number of tracked nonces before oldest-first eviction. Defaults to 1000. */
+  maxEntries?: number;
+}
+
+/**
+ * Optional request deduplication keyed by nonce.
+ *
+ * Tracks recently seen nonces so that a repeated request (same nonce) can be
+ * detected and rejected.  When disabled (the default) every nonce is accepted
+ * and no state is retained, so callers can adopt it without changing behaviour.
+ *
+ * Usage:
+ *   const dedup = new NonceDeduplicator({ enabled: true, ttlMs: 60_000 });
+ *   dedup.on("dedup", (e) => console.log(e.outcome));
+ *   if (dedup.check(nonce) === "duplicate") { ... }
+ */
+export class NonceDeduplicator {
+  private readonly enabled: boolean;
+  private readonly ttlMs: number;
+  private readonly maxEntries: number;
+  private readonly seen = new Map<string, number>();
+  private readonly listeners = new Set<NonceDedupListener>();
+
+  constructor(config?: NonceDeduplicatorConfig) {
+    this.enabled = config?.enabled ?? false;
+    this.ttlMs = config?.ttlMs ?? 300_000;
+    this.maxEntries = config?.maxEntries ?? 1000;
+  }
+
+  /**
+   * Evaluate `nonce` and record it when accepted.
+   *
+   * @returns `"duplicate"` when the nonce was seen within the TTL window,
+   *          otherwise `"accepted"`.  Always `"accepted"` when disabled.
+   */
+  check(nonce: string): NonceDedupOutcome {
+    if (!this.enabled) {
+      this.emit({ nonce, outcome: "accepted", timestamp: Date.now() });
+      return "accepted";
+    }
+
+    this.purgeExpired();
+
+    if (this.seen.has(nonce)) {
+      this.emit({ nonce, outcome: "duplicate", timestamp: Date.now() });
+      return "duplicate";
+    }
+
+    if (this.maxEntries > 0 && this.seen.size >= this.maxEntries) {
+      const oldest = this.seen.keys().next().value;
+      if (oldest !== undefined) this.seen.delete(oldest);
+    }
+
+    this.seen.set(nonce, Date.now() + this.ttlMs);
+    this.emit({ nonce, outcome: "accepted", timestamp: Date.now() });
+    return "accepted";
+  }
+
+  /** Convenience predicate: `true` when `nonce` is a duplicate. */
+  isDuplicate(nonce: string): boolean {
+    return this.check(nonce) === "duplicate";
+  }
+
+  /** Register a listener for deduplication decisions. */
+  on(_event: "dedup", listener: NonceDedupListener): void {
+    this.listeners.add(listener);
+  }
+
+  /** Remove a previously registered listener. */
+  off(_event: "dedup", listener: NonceDedupListener): void {
+    this.listeners.delete(listener);
+  }
+
+  /** Remove all tracked nonces. */
+  clear(): void {
+    this.seen.clear();
+  }
+
+  /** Number of nonces currently tracked (including not-yet-evicted expired ones). */
+  get size(): number {
+    return this.seen.size;
+  }
+
+  // ── private helpers ──────────────────────────────────────────────────────
+
+  private purgeExpired(): void {
+    const now = Date.now();
+    for (const [nonce, expiresAt] of this.seen) {
+      if (now > expiresAt) this.seen.delete(nonce);
+    }
+  }
+
+  private emit(event: NonceDedupEvent): void {
+    for (const listener of this.listeners) {
+      listener(event);
+    }
   }
 }
