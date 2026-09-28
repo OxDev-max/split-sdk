@@ -223,6 +223,7 @@ import {
   StellarSplitError,
   AdminOperationError,
   PassphraseMismatchError,
+  NetworkMismatchError,
   InvoiceIntegrityError,
   InvoiceNotCloneableError,
   InvalidTransactionTypeError,
@@ -299,6 +300,13 @@ import type {
   CircuitBreakerConfig,
 } from "./resilientRpc.js";
 import { NetworkPassphraseValidator } from "./network/NetworkPassphraseValidator.js";
+import {
+  NetworkEnvironment,
+  getNetworkPreset,
+  isNetworkPreset,
+  detectNetworkEnvironment,
+} from "./config.js";
+import type { NetworkPreset } from "./config.js";
 import type { OtelHandle, TelemetryOptions } from "./telemetry/OtelExporter.js";
 import { createOtelHandle, noopOtelHandle, OtelExporter } from "./telemetry/OtelExporter.js";
 
@@ -709,6 +717,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   private _requestSeq = 0;
   private readonly _inFlightRequests = new Map<string, InFlightRequestInfo>();
   private readonly _inFlightRequestPromises = new Map<string, Promise<unknown>>();
+  /** Network the client is currently bound to (see `switchNetwork`). */
+  private _activeEnvironment: NetworkEnvironment =
+    NetworkEnvironment.CUSTOM;
+  /** Resolved preset for the active network, when known. */
+  private _activePreset: NetworkPreset | null = null;
   private readonly _managedHorizonStreams = new Set<{ stop(): void }>();
   private readonly _stateMachine: InvoiceStateMachine;
   /**
@@ -860,6 +873,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    */
     validateOrThrow(config);
     this.config = config;
+    this._activeEnvironment = detectNetworkEnvironment(config.networkPassphrase);
     this._metadataValidator = new InvoiceMetadataValidator(
       config.metadataSchema,
       config.metadataThrowOnInvalid ?? true,
@@ -6335,78 +6349,228 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Switch to a different network.
+   * Switches the client to a different Stellar network at runtime.
    *
-   * @param network - Network name ('testnet', 'mainnet') or custom NetworkConfig
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * The Soroban RPC endpoint of the requested network is contacted and the
+   * passphrase it reports is compared against the preset **before** the switch
+   * is accepted. When they disagree a {@link NetworkMismatchError} is thrown
+   * and the client keeps its current configuration.
+   *
+   * Requests that are already in flight when this method is called are awaited
+   * to completion so they finish against the original network; requests issued
+   * after the returned promise resolves observe the new configuration.
+   *
+   * Passing {@link NetworkEnvironment.CUSTOM} requires a full
+   * {@link NetworkPreset} — omitting it is rejected at compile time by the
+   * overload signatures and throws at runtime for untyped callers.
+   *
+   * @example
+   * ```ts
+   * await client.switchNetwork(NetworkEnvironment.TESTNET);
+   * await client.switchNetwork(NetworkEnvironment.CUSTOM, {
+   *   horizonUrl: "https://horizon.example.org",
+   *   rpcUrl: "https://rpc.example.org",
+   *   networkPassphrase: "Example Network ; 2026",
+   * });
+   * ```
    */
-  switchNetwork(network: string | NetworkConfig): void {
-    let config: NetworkConfig;
+  switchNetwork(
+    environment:
+      | NetworkEnvironment.MAINNET
+      | NetworkEnvironment.TESTNET
+      | NetworkEnvironment.FUTURENET,
+  ): Promise<void>;
+  switchNetwork(
+    environment: NetworkEnvironment.CUSTOM,
+    preset: NetworkPreset,
+  ): Promise<void>;
+  switchNetwork(preset: NetworkPreset): Promise<void>;
+  /**
+   * @deprecated Pass a {@link NetworkEnvironment} member or a
+   * {@link NetworkPreset} instead. The legacy `"testnet" | "mainnet"` string
+   * and {@link NetworkConfig} forms are still accepted for backwards
+   * compatibility.
+   */
+  switchNetwork(
+    network: "mainnet" | "testnet" | "futurenet" | NetworkConfig,
+  ): Promise<void>;
+  async switchNetwork(
+    environmentOrPreset:
+      | NetworkEnvironment
+      | NetworkPreset
+      | "mainnet"
+      | "testnet"
+      | "futurenet"
+      | NetworkConfig,
+    customPreset?: NetworkPreset,
+  ): Promise<void> {
+    const target = this._resolveNetworkTarget(environmentOrPreset, customPreset);
 
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-    if (typeof network === "string") {
-      const preset = NETWORKS[network];
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-      if (!preset) {
-        throw new UnknownNetworkError(network);
-      }
-      config = { ...preset, contractId: this.config.contractId };
-    } else {
-      config = network;
+    // Fail fast: cross-check the preset against the live RPC node before we
+    // touch any client state. `NetworkPassphraseValidator.validate` fails open
+    // when the node is unreachable, matching startup validation.
+    const validation = await NetworkPassphraseValidator.validate(
+      target.preset.networkPassphrase,
+      target.preset.rpcUrl,
+    );
+    if (validation.mismatch) {
+      throw new NetworkMismatchError(validation.configured, validation.reported);
     }
 
-    this.config = config;
-    this.server = new SorobanRpc.Server(config.rpcUrl, {
-      allowHttp: config.rpcUrl.startsWith("http://"),
+    // Let already-issued requests settle against the original network.
+    await this.waitForInFlightRequests();
+
+    // Everything below is synchronous, so no request can observe a
+    // half-applied endpoint.
+    this.config = {
+      ...this.config,
+      rpcUrl: target.preset.rpcUrl,
+      networkPassphrase: target.preset.networkPassphrase,
+      horizonUrl: target.preset.horizonUrl,
+      ...(target.contractId ? { contractId: target.contractId } : {}),
+    };
+    this._activeEnvironment = target.environment;
+    this._activePreset = target.preset;
+
+    this._rebindNetworkEndpoint(target.preset);
+  }
+
+  /** The {@link NetworkEnvironment} the client is currently bound to. */
+  get activeNetwork(): NetworkEnvironment {
+    return this._activeEnvironment;
+  }
+
+  /** The resolved {@link NetworkPreset} backing the active network. */
+  get activeNetworkPreset(): NetworkPreset {
+    return (
+      this._activePreset ?? {
+        horizonUrl: this.config.horizonUrl ?? "",
+        rpcUrl: Array.isArray(this.config.rpcUrl)
+          ? this.config.rpcUrl[0]!
+          : this.config.rpcUrl,
+        networkPassphrase: this.config.networkPassphrase,
+      }
+    );
+  }
+
+  /** Normalises every accepted `switchNetwork` argument shape. */
+  private _resolveNetworkTarget(
+    environmentOrPreset:
+      | NetworkEnvironment
+      | NetworkPreset
+      | "mainnet"
+      | "testnet"
+      | "futurenet"
+      | NetworkConfig,
+    customPreset?: NetworkPreset,
+  ): {
+    preset: NetworkPreset;
+    environment: NetworkEnvironment;
+    contractId?: string;
+  } {
+    if (isNetworkPreset(environmentOrPreset)) {
+      return {
+        preset: environmentOrPreset,
+        environment: NetworkEnvironment.CUSTOM,
+      };
+    }
+
+    if (typeof environmentOrPreset === "object" && environmentOrPreset !== null) {
+      // Legacy NetworkConfig shape (carries `contractId`, no `horizonUrl`).
+      const legacy = environmentOrPreset as NetworkConfig;
+      return {
+        preset: {
+          horizonUrl: this.config.horizonUrl ?? "",
+          rpcUrl: legacy.rpcUrl,
+          networkPassphrase: legacy.networkPassphrase,
+        },
+        environment: NetworkEnvironment.CUSTOM,
+        contractId: legacy.contractId,
+      };
+    }
+
+    if (environmentOrPreset === NetworkEnvironment.CUSTOM) {
+      if (!customPreset || !isNetworkPreset(customPreset)) {
+        throw new ValidationError(
+          "NetworkEnvironment.CUSTOM requires a full NetworkPreset " +
+            "({ horizonUrl, rpcUrl, networkPassphrase }).",
+        );
+      }
+      return { preset: customPreset, environment: NetworkEnvironment.CUSTOM };
+    }
+
+    const environment = environmentOrPreset as Exclude<
+      NetworkEnvironment,
+      NetworkEnvironment.CUSTOM
+    >;
+    return {
+      preset: getNetworkPreset(environment),
+      environment: environment as NetworkEnvironment,
+    };
+  }
+
+  /** Rebinds every endpoint-bound subsystem to a new network preset. */
+  private _rebindNetworkEndpoint(preset: NetworkPreset): void {
+    // A warm-standby list or a load balancer belongs to the previous network.
+    this._standby?.stop();
+    this._standby = null;
+    if (this._rpcLoadBalancer) {
+      this._rpcLoadBalancer.stop();
+      this._rpcLoadBalancer = null;
+    }
+
+    this.server = new SorobanRpc.Server(preset.rpcUrl, {
+      allowHttp: preset.rpcUrl.startsWith("http://"),
     });
 
-    // Rebuild the connection pool for the new endpoint. We read from
-    // `_effectiveRpcPoolSize` (cached at construction) rather than
-    // `this.config.rpcPoolSize` here because `NetworkConfig` doesn't carry a
-    // pool size — reading from `this.config` after `this.config = config`
-    // above would silently disable pooling on every network switch.
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-    if (this._pool) {
-      this._pool.dispose();
-      this._pool = null;
+    // `server`'s getter prefers a resilient wrapper, so rebuild it when the
+    // client was constructed with a circuit breaker.
+    if (this.config.circuitBreaker) {
+      const rpcTarget =
+        this._injectedRpcClient ?? this._rpcClient ?? this._mainServer;
+      this._resilientRpc = new ResilientRpcClient(
+        rpcTarget,
+        this.config.circuitBreaker.retry,
+        this.config.circuitBreaker.breaker,
+      );
+      this._resilientRpc.on("circuit:open", () =>
+        this.emit("circuit:open", undefined),
+      );
+      this._resilientRpc.on("circuit:close", () =>
+        this.emit("circuit:close", undefined),
+      );
+      this._resilientRpc.on("circuit:half-open", () =>
+        this.emit("circuit:half-open", undefined),
+      );
+    } else {
+      this._resilientRpc = null;
     }
-    const wantsPool = !this._standby && this._effectiveRpcPoolSize >= 2;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-    if (wantsPool) {
+
+    // Rebuild the connection pool for the new endpoint, reading the cached
+    // pool size because `_effectiveRpcPoolSize` survives config swaps.
+    this._pool?.dispose();
+    this._pool = null;
+    if (this._effectiveRpcPoolSize >= 2) {
       try {
         this._pool = new ConnectionPool({
-          rpcUrl: config.rpcUrl,
+          rpcUrl: preset.rpcUrl,
           poolSize: this._effectiveRpcPoolSize,
-          allowHttp: config.rpcUrl.startsWith("http://"),
+          allowHttp: preset.rpcUrl.startsWith("http://"),
         });
       } catch {
-        // The Soroban SDK can reject bare http:// without allowHttp or ws:// URLs.
-        // Fail open so switchNetwork() stays a no-op rather than crashing the SDK.
+        // The Soroban SDK rejects some URL shapes; fall back to a single
+        // connection rather than failing the whole switch.
       }
     }
 
-    this.contract = new Contract(config.contractId);
+    // Rebind the Horizon fallback reader and the feature detector, both of
+    // which captured the previous URL at construction time.
+    this._horizonReader = preset.horizonUrl
+      ? new HorizonFallbackReader(preset.horizonUrl)
+      : null;
+    this._sorobanFeatureDetector = new SorobanFeatureDetector({
+      rpcUrl: preset.rpcUrl,
+    });
   }
 
   // ---------------------------------------------------------------------------

@@ -16,6 +16,15 @@ export type {
   StellarSplitPlugin,
 } from "./client.js";
 
+export {
+  NetworkEnvironment,
+  NETWORK_PRESETS,
+  isNetworkPreset,
+  getNetworkPreset,
+  detectNetworkEnvironment,
+} from "./config.js";
+export type { NetworkPreset } from "./config.js";
+
 export type {
   TelemetryHooks,
   TelemetryErrorContext,
@@ -178,6 +187,8 @@ export {
   isRequestTimeoutError,
   AdminOperationError,
   isAdminOperationError,
+  NetworkMismatchError,
+  isNetworkMismatchError,
   CommitmentGenerationError,
   isCommitmentGenerationError,
   BlindingFactorStorageError,
