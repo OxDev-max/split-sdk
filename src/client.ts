@@ -7894,6 +7894,306 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   // ---------------------------------------------------------------------------
+  // Issue #866 — Pause/Resume invoice
+  // ---------------------------------------------------------------------------
+
+  async pauseInvoice(
+    invoiceId: string,
+    options?: { autoResumeAt?: Date },
+  ): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const autoResumeTimestamp = options?.autoResumeAt
+        ? Math.floor(options.autoResumeAt.getTime() / 1000)
+        : 0;
+
+      const operation = this.contract.call(
+        "pause_invoice",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(autoResumeTimestamp, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("pauseInvoice", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("pauseInvoice", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async resumeInvoice(invoiceId: string): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "resume_invoice",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("resumeInvoice", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("resumeInvoice", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async isPaused(invoiceId: string): Promise<PauseStatus> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "is_paused",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+      const paused = Boolean(raw.paused);
+      const autoResumeTimestamp = Number(raw.autoResumeAt ?? raw.auto_resume_at ?? 0);
+
+      telemetry.recordMethod("isPaused", true, Date.now() - startTime);
+      return {
+        paused,
+        autoResumeAt: autoResumeTimestamp > 0 ? new Date(autoResumeTimestamp * 1000) : undefined,
+      };
+    } catch (error) {
+      telemetry.recordMethod("isPaused", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #867 — Pledge matching
+  // ---------------------------------------------------------------------------
+
+  async pledgeMatch(invoiceId: string, amount: bigint): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "pledge_match",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(amount, { type: "i128" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("pledgeMatch", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("pledgeMatch", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async claimUnmatchedPledge(invoiceId: string): Promise<bigint> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "claim_unmatched_pledge",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const amount = scValToNative(result.returnValue) as bigint;
+      telemetry.recordMethod("claimUnmatchedPledge", true, Date.now() - startTime);
+      return amount;
+    } catch (error) {
+      telemetry.recordMethod("claimUnmatchedPledge", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async getMatchPool(invoiceId: string): Promise<MatchPledge[]> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "get_match_pool",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as Array<Record<string, unknown>>;
+      const pledges: MatchPledge[] = (raw || []).map((p) => ({
+        matcher: p.matcher as string,
+        pledgedAmount: toBigInt(p.pledgedAmount ?? p.pledged_amount),
+        matchedAmount: toBigInt(p.matchedAmount ?? p.matched_amount),
+        unmatched: toBigInt(p.unmatched),
+      }));
+
+      telemetry.recordMethod("getMatchPool", true, Date.now() - startTime);
+      return pledges;
+    } catch (error) {
+      telemetry.recordMethod("getMatchPool", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #868 — Streaming payments
+  // ---------------------------------------------------------------------------
+
+  async startStream(invoiceId: string, amountPerLedger: bigint): Promise<string> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "start_stream",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(amountPerLedger, { type: "i128" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const streamId = scValToNative(result.returnValue).toString();
+      telemetry.recordMethod("startStream", true, Date.now() - startTime);
+      return streamId;
+    } catch (error) {
+      telemetry.recordMethod("startStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async settleStream(streamId: string): Promise<bigint> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "settle_stream",
+        nativeToScVal(streamId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const amount = scValToNative(result.returnValue) as bigint;
+      telemetry.recordMethod("settleStream", true, Date.now() - startTime);
+      return amount;
+    } catch (error) {
+      telemetry.recordMethod("settleStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async cancelStream(streamId: string): Promise<bigint> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "cancel_stream",
+        nativeToScVal(streamId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const amount = scValToNative(result.returnValue) as bigint;
+      telemetry.recordMethod("cancelStream", true, Date.now() - startTime);
+      return amount;
+    } catch (error) {
+      telemetry.recordMethod("cancelStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async getStream(streamId: string): Promise<Stream> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "get_stream",
+        nativeToScVal(streamId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+      const stream: Stream = {
+        id: streamId,
+        invoiceId: raw.invoiceId as string,
+        payer: raw.payer as string,
+        amountPerLedger: toBigInt(raw.amountPerLedger ?? raw.amount_per_ledger),
+        startLedger: Number(raw.startLedger ?? raw.start_ledger),
+        status: (raw.status as string).toLowerCase() as "active" | "settled" | "cancelled",
+      };
+
+      telemetry.recordMethod("getStream", true, Date.now() - startTime);
+      return stream;
+    } catch (error) {
+      telemetry.recordMethod("getStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  computeAccruedAmount(stream: Stream, currentLedger: number): bigint {
+    if (stream.status !== "active") return 0n;
+    const ledgersPassed = Math.max(0, currentLedger - stream.startLedger);
+    return stream.amountPerLedger * BigInt(ledgersPassed);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #869 — Delegate management
+  // ---------------------------------------------------------------------------
+
+  async addDelegate(invoiceId: string, delegate: string): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "add_delegate",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(delegate, { type: "address" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("addDelegate", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("addDelegate", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async removeDelegate(invoiceId: string, delegate: string): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "remove_delegate",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(delegate, { type: "address" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("removeDelegate", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("removeDelegate", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async isDelegate(invoiceId: string, address: string): Promise<boolean> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "is_delegate",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(address, { type: "address" }),
+      );
+
+      const result = await this._simulateView(operation);
+      const isDelegate = Boolean(result);
+      telemetry.recordMethod("isDelegate", true, Date.now() - startTime);
+      return isDelegate;
+    } catch (error) {
+      telemetry.recordMethod("isDelegate", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async getDelegates(invoiceId: string): Promise<string[]> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "get_delegates",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as string[];
+      telemetry.recordMethod("getDelegates", true, Date.now() - startTime);
+      return raw || [];
+    } catch (error) {
+      telemetry.recordMethod("getDelegates", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------------
 
