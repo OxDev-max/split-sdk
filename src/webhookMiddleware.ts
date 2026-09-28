@@ -12,6 +12,7 @@
 
 import type { Request, Response, NextFunction } from "express";
 import { ValidationError } from "./errors.js";
+import { TypedEventEmitter } from "./events/TypedEventEmitter.js";
 
 // ============================================================================
 // Type Definitions
@@ -175,6 +176,65 @@ export type RequestHandler = (
   res: Response,
   next: NextFunction,
 ) => void | Promise<void>;
+
+/**
+ * Payload delivered to {@link WebhookEventEmitter.on} handlers.
+ *
+ * It extends the raw delivery with the event type and the request that carried
+ * it, so handlers can route on `event` without re-inspecting the payload.
+ */
+export interface WebhookEventContext<T = unknown> extends WebhookPayload<T> {
+  /** The event name the payload was delivered under. */
+  event: InvoiceEventType;
+  /** The validated request the delivery arrived on. */
+  request: Request;
+}
+
+/**
+ * Maps each {@link InvoiceEventType} to the `data` shape it carries.
+ *
+ * This is what makes `on()` type-safe: registering a handler for
+ * `"invoice.paid"` gives that handler a typed `data` with no cast required.
+ */
+export interface WebhookEventMap extends Record<string, unknown> {
+  "invoice.created": WebhookEventContext<InvoiceCreatedData>;
+  "invoice.paid": WebhookEventContext<InvoicePaidData>;
+  "invoice.released": WebhookEventContext<InvoiceReleasedData>;
+  "invoice.failed": WebhookEventContext<InvoiceFailedData>;
+  "invoice.refunded": WebhookEventContext<InvoiceRefundedData>;
+  "invoice.cancelled": WebhookEventContext<InvoiceCancelledData>;
+  "invoice.expired": WebhookEventContext<InvoiceExpiredData>;
+}
+
+/**
+ * A typed event emitter for validated webhook deliveries.
+ *
+ * A middleware created by {@link createWebhookMiddleware} exposes one of
+ * these as `.emitter`, so callers can subscribe per event type instead of
+ * writing a `switch` in a downstream Express handler.
+ *
+ * @example
+ * ```ts
+ * const middleware = createWebhookMiddleware(secret);
+ *
+ * middleware.emitter.on("invoice.paid", ({ data }) => {
+ *   console.log(data.invoiceId, data.amount); // both typed as string
+ * });
+ * ```
+ */
+export type WebhookEventEmitter = TypedEventEmitter<WebhookEventMap>;
+
+/**
+ * The middleware returned by {@link createWebhookMiddleware}.
+ *
+ * It is a plain `RequestHandler` (so it drops straight into Express or a
+ * Next.js route) with a typed {@link WebhookEventEmitter} attached, letting
+ * consumers subscribe to validated deliveries without a `switch` statement.
+ */
+export interface WebhookMiddleware extends RequestHandler {
+  /** Emits every validated delivery, keyed by {@link InvoiceEventType}. */
+  emitter: WebhookEventEmitter;
+}
 
 // ============================================================================
 // LRU Cache Implementation
@@ -534,7 +594,7 @@ const DEFAULT_OPTIONS: Required<WebhookOptions> = {
 export function createWebhookMiddleware(
   secret: string,
   options?: WebhookOptions,
-): RequestHandler {
+): WebhookMiddleware {
   if (!secret || typeof secret !== "string" || secret.length === 0) {
     throw new ValidationError("Webhook secret must be a non-empty string");
   }
@@ -547,8 +607,21 @@ export function createWebhookMiddleware(
   // Initialize LRU cache for nonce tracking
   const nonceCache = new LRUCache<string, number>(config.nonceWindowSize);
 
-  // Return the middleware function
-  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  // Typed emitter that publishes every successfully validated delivery, so
+  // callers can subscribe per event type instead of branching in a handler.
+  const emitter = new TypedEventEmitter<WebhookEventMap>();
+
+  /**
+   * The middleware function, with the typed emitter attached as `.emitter`.
+   *
+   * It stays directly callable as an Express handler — Express only ever
+   * invokes `req, res, next`, so the extra property is inert there.
+   */
+  const handler: WebhookMiddleware = async (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
     try {
       // ====================================================================
       // Step 1: Extract and validate headers
@@ -670,6 +743,17 @@ export function createWebhookMiddleware(
       (req as WebhookRequest).webhookPayload = payload;
       (req as WebhookRequest).rawWebhookBody = rawBody;
 
+      // ===================================================================
+      // Step 9: Publish to the typed emitter
+      // Only validated deliveries reach listeners, so a subscriber can trust
+      // that anything it receives passed signature, timestamp and nonce checks.
+      // `payload` is validated structurally above, so the `data` shape is only
+      // known per event type; the cast bridges that gap for the typed emitter.
+      emitter.emit(
+        payload.event,
+        { ...payload, event: payload.event, request: req } as WebhookEventMap[typeof payload.event],
+      );
+
       // All checks passed - proceed to next middleware/handler
       next();
     } catch (error) {
@@ -691,6 +775,11 @@ export function createWebhookMiddleware(
       });
     }
   };
+
+  // Attach the emitter so callers can `middleware.emitter.on("invoice.paid", ...)`.
+  handler.emitter = emitter;
+
+  return handler;
 }
 
 // ============================================================================

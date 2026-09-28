@@ -745,3 +745,183 @@ describe("LRU Cache (via middleware)", () => {
     expect(next).toHaveBeenCalled(); // Should succeed (was evicted)
   });
 });
+
+// ===========================================================================
+// Typed Event Emitter Tests
+// ===========================================================================
+
+describe("createWebhookMiddleware — typed event emitter", () => {
+  /** Build signed request headers for `payload`. */
+  async function signedRequest(payload: WebhookPayload) {
+    const rawBody = JSON.stringify(payload);
+    const signature = await generateWebhookSignature(payload, TEST_SECRET);
+    const ts = String(payload.timestamp);
+    return createMockRequest(Buffer.from(rawBody), {
+      "x-stellarsplit-signature": signature,
+      "x-stellarsplit-timestamp": ts,
+      "x-stellarsplit-nonce": payload.nonce,
+    });
+  }
+
+  it("exposes an emitter on the returned middleware", () => {
+    const middleware = createWebhookMiddleware(TEST_SECRET);
+    expect(middleware.emitter).toBeDefined();
+    expect(typeof middleware.emitter.on).toBe("function");
+  });
+
+  it("remains directly callable as a RequestHandler", () => {
+    const middleware = createWebhookMiddleware(TEST_SECRET);
+    // Express invokes handlers with exactly three arguments; the attached
+    // emitter must not interfere with that calling convention.
+    expect(typeof middleware).toBe("function");
+    expect(middleware.length).toBe(3);
+  });
+
+  it("emits a validated invoice.paid delivery to its handler", async () => {
+    const middleware = createWebhookMiddleware(TEST_SECRET);
+    const handler = vi.fn();
+    middleware.emitter.on("invoice.paid", handler);
+
+    const payload = createTestPayload("invoice.paid", {
+      invoiceId: "42",
+      payer: "GPARTY",
+      amount: "1000",
+      funded: "1000",
+      remaining: "0",
+      txHash: "abc",
+    });
+    const next = createMockNext();
+
+    await middleware((await signedRequest(payload)) as Request, createMockResponse() as Response, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(handler).toHaveBeenCalledTimes(1);
+    const ctx = handler.mock.calls[0]?.[0];
+    expect(ctx.event).toBe("invoice.paid");
+    expect(ctx.data.invoiceId).toBe("42");
+    expect(ctx.nonce).toBe(payload.nonce);
+  });
+
+  it("routes deliveries only to the matching event handler", async () => {
+    const middleware = createWebhookMiddleware(TEST_SECRET);
+    const paid = vi.fn();
+    const released = vi.fn();
+    middleware.emitter.on("invoice.paid", paid);
+    middleware.emitter.on("invoice.released", released);
+
+    const payload = createTestPayload("invoice.paid");
+    await middleware(
+      (await signedRequest(payload)) as Request,
+      createMockResponse() as Response,
+      createMockNext(),
+    );
+
+    expect(paid).toHaveBeenCalledTimes(1);
+    expect(released).not.toHaveBeenCalled();
+  });
+
+  it("does not emit when the signature is invalid", async () => {
+    const middleware = createWebhookMiddleware(TEST_SECRET);
+    const handler = vi.fn();
+    middleware.emitter.on("invoice.paid", handler);
+
+    const payload = createTestPayload("invoice.paid");
+    const rawBody = JSON.stringify(payload);
+    const res = createMockResponse();
+    await middleware(
+      createMockRequest(Buffer.from(rawBody), {
+        "x-stellarsplit-signature": "a".repeat(64),
+        "x-stellarsplit-timestamp": String(payload.timestamp),
+        "x-stellarsplit-nonce": payload.nonce,
+      }) as Request,
+      res as Response,
+      createMockNext(),
+    );
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  it("does not emit when the timestamp is outside the tolerance window", async () => {
+    const middleware = createWebhookMiddleware(TEST_SECRET, { toleranceSeconds: 1 });
+    const handler = vi.fn();
+    middleware.emitter.on("invoice.paid", handler);
+
+    const payload = createTestPayload("invoice.paid");
+    payload.timestamp = Math.floor(Date.now() / 1000) - 3600;
+    const res = createMockResponse();
+    await middleware(
+      (await signedRequest(payload)) as Request,
+      res as Response,
+      createMockNext(),
+    );
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  it("does not emit a replayed nonce twice", async () => {
+    const middleware = createWebhookMiddleware(TEST_SECRET);
+    const handler = vi.fn();
+    middleware.emitter.on("invoice.paid", handler);
+
+    const payload = createTestPayload("invoice.paid");
+    const req = await signedRequest(payload);
+
+    await middleware(req as Request, createMockResponse() as Response, createMockNext());
+    const res = createMockResponse();
+    await middleware(req as Request, res as Response, createMockNext());
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  it("stops emitting once a handler is unsubscribed", async () => {
+    const middleware = createWebhookMiddleware(TEST_SECRET);
+    const handler = vi.fn();
+    const unsubscribe = middleware.emitter.on("invoice.paid", handler);
+    unsubscribe();
+
+    const payload = createTestPayload("invoice.paid");
+    await middleware(
+      (await signedRequest(payload)) as Request,
+      createMockResponse() as Response,
+      createMockNext(),
+    );
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("supports a wildcard handler for every event type", async () => {
+    const middleware = createWebhookMiddleware(TEST_SECRET);
+    const all = vi.fn();
+    middleware.emitter.on("*", all);
+
+    for (const event of ["invoice.created", "invoice.paid", "invoice.expired"] as const) {
+      const payload = createTestPayload(event);
+      await middleware(
+        (await signedRequest(payload)) as Request,
+        createMockResponse() as Response,
+        createMockNext(),
+      );
+    }
+
+    expect(all).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps emitter state isolated between middleware instances", async () => {
+    const first = createWebhookMiddleware(TEST_SECRET);
+    const second = createWebhookMiddleware(TEST_SECRET);
+    const handler = vi.fn();
+    first.emitter.on("invoice.paid", handler);
+
+    const payload = createTestPayload("invoice.paid");
+    await second(
+      (await signedRequest(payload)) as Request,
+      createMockResponse() as Response,
+      createMockNext(),
+    );
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+});

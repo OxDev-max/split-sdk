@@ -92,3 +92,74 @@ describe("WaterfallRouter", () => {
     expect(() => router.plan(invoice, -1n, threeTierConfig())).toThrow();
   });
 });
+
+describe("WaterfallRouter route scoring (Issue #777)", () => {
+  const router = new WaterfallRouter();
+  const invoice = createMockInvoice({ token: "NATIVE_TOKEN" });
+
+  it("tries routes in score-descending order, not declaration order", () => {
+    const result = router.plan(invoice, 150n, {
+      tiers: [
+        { recipient: BENEFICIARY, minimumAmount: 700n, score: 1 },
+        { recipient: PLATFORM, minimumAmount: 100n, score: 9 },
+        { recipient: TAX, minimumAmount: 200n, score: 5 },
+      ],
+    });
+
+    // PLATFORM (score 9) is funded first, TAX (5) blocks on the 50 stroops left,
+    // and BENEFICIARY (1) stays blocked behind it.
+    expect(result.steps.map((s) => s.recipient)).toEqual([PLATFORM, TAX, BENEFICIARY]);
+    expect(result.steps[0]).toMatchObject({ amount: 100n, satisfied: true });
+    expect(result.steps[1]).toMatchObject({ amount: 0n, satisfied: false });
+    expect(result.totalAllocated).toBe(100n);
+    expect(result.remaining).toBe(50n);
+  });
+
+  it("defaults a missing score to 0", () => {
+    const result = router.plan(invoice, 1000n, {
+      tiers: [
+        { recipient: PLATFORM, minimumAmount: 100n },
+        { recipient: TAX, minimumAmount: 200n, score: 0 },
+        { recipient: BENEFICIARY, minimumAmount: 700n, score: 5 },
+      ],
+    });
+
+    expect(result.steps.map((s) => s.recipient)).toEqual([BENEFICIARY, PLATFORM, TAX]);
+  });
+
+  it("keeps declaration order (FIFO) for tied scores", () => {
+    const result = router.plan(invoice, 1000n, {
+      tiers: [
+        { recipient: BENEFICIARY, minimumAmount: 300n, score: 3 },
+        { recipient: PLATFORM, minimumAmount: 300n, score: 3 },
+        { recipient: TAX, minimumAmount: 400n, score: 3 },
+      ],
+    });
+
+    expect(result.steps.map((s) => s.recipient)).toEqual([BENEFICIARY, PLATFORM, TAX]);
+    expect(result.fullySatisfied).toBe(true);
+  });
+
+  it("preserves declared order for an entirely unscored config", () => {
+    const result = router.plan(invoice, 1000n, {
+      tiers: [
+        { recipient: PLATFORM, minimumAmount: 100n },
+        { recipient: TAX, minimumAmount: 200n },
+        { recipient: BENEFICIARY, minimumAmount: 700n },
+      ],
+    });
+
+    expect(result.steps.map((s) => s.recipient)).toEqual([PLATFORM, TAX, BENEFICIARY]);
+  });
+
+  it("does not mutate the caller's tier array", () => {
+    const tiers = [
+      { recipient: PLATFORM, minimumAmount: 100n, score: 1 },
+      { recipient: BENEFICIARY, minimumAmount: 100n, score: 9 },
+    ];
+
+    router.plan(invoice, 1000n, { tiers });
+
+    expect(tiers.map((t) => t.recipient)).toEqual([PLATFORM, BENEFICIARY]);
+  });
+});
