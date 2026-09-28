@@ -1455,3 +1455,50 @@ export type {
   SubmitTransactionOptions,
   SubmitServer,
 } from "./transaction/submit.js";
+
+// Request queue with priority lanes
+export { RequestQueue } from "./requestQueue.js";
+export type { PriorityLane, QueuedRequest, QueueStats } from "./requestQueue.js";
+
+// Invoice history retrieval and parsing
+export { getInvoiceHistory, getHistoryPage, parseHistoryEvent } from "./invoiceHistory.js";
+export type {
+  HistoryEntry,
+  HistoryEventType,
+  HistoryPage,
+  HistoryPageOptions,
+  PaymentHistoryEntry,
+  ReleaseHistoryEntry,
+  RefundHistoryEntry,
+  NoteHistoryEntry,
+  PauseHistoryEntry,
+  ResumeHistoryEntry,
+  CancelHistoryEntry,
+  FreezeHistoryEntry,
+  UnfreezeHistoryEntry,
+} from "./types/invoiceHistory.js";
+
+// Template management
+export {
+  saveTemplate,
+  createFromTemplate,
+  deleteTemplate,
+  getTemplate,
+  listTemplates,
+  TemplateNotFoundError,
+  TemplateAccessDeniedError,
+} from "./templates.js";
+export type { InvoiceTemplate, CreateFromTemplateParams, SaveTemplateParams } from "./types/templates.js";
+
+// Recurring subscriptions
+export {
+  createSubscription,
+  triggerSubscription,
+  pauseSubscription,
+  resumeSubscription,
+  getSubscription,
+  cancelSubscription,
+  SubscriptionNotFoundError,
+  TooEarlyToTriggerError,
+} from "./subscriptions.js";
+export type { Subscription, SubscriptionStatus, CreateSubscriptionParams } from "./types/subscriptions.js";
