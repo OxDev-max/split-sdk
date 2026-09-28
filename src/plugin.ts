@@ -2,7 +2,8 @@
  * Plugin/middleware system for StellarSplitClient.
  *
  * Plugins intercept SDK method calls to add logging, caching, retry logic,
- * or request transformation without forking the SDK.
+ * or request transformation without forking the SDK. Plugins can also add
+ * custom methods, subscribe to events, and intercept RPC calls.
  */
 
 import { PluginAlreadyRegisteredError } from "./errors.js";
@@ -10,10 +11,21 @@ import { PluginAlreadyRegisteredError } from "./errors.js";
 /** Method names that plugins can intercept. */
 export type SdkMethodName = "createInvoice" | "pay";
 
-/** A plugin that intercepts SDK method calls. */
+/** Client context passed to plugin install method. */
+export interface StellarSplitClientContext {
+  on<E extends string>(event: E, handler: (payload: unknown) => void): () => void;
+  off<E extends string>(event: E, handler: (payload: unknown) => void): void;
+}
+
+/** A plugin that intercepts SDK method calls and extends functionality. */
 export interface SdkPlugin<M extends SdkMethodName = SdkMethodName> {
   /** Unique plugin name. */
   name: string;
+  /**
+   * Called when the plugin is installed on a client.
+   * Can be used to add methods, subscribe to events, or initialize state.
+   */
+  install?(client: StellarSplitClientContext, options?: Record<string, unknown>): void;
   /**
    * Called before a method executes. May return modified args.
    * Applied in registration order.
@@ -43,12 +55,20 @@ export type PluginResult<M extends SdkMethodName> =
 /** Manages a list of registered SdkPlugins. */
 export class PluginRegistry {
   private _plugins: SdkPlugin[] = [];
+  private _clientContext?: StellarSplitClientContext;
 
-  use(plugin: SdkPlugin): void {
+  use(plugin: SdkPlugin, options?: Record<string, unknown>): void {
     if (this._plugins.some((p) => p.name === plugin.name)) {
       throw new PluginAlreadyRegisteredError(plugin.name);
     }
     this._plugins.push(plugin);
+    if (this._clientContext && plugin.install) {
+      plugin.install(this._clientContext, options);
+    }
+  }
+
+  setClientContext(context: StellarSplitClientContext): void {
+    this._clientContext = context;
   }
 
   removePlugin(name: string): void {
@@ -99,3 +119,26 @@ export const LoggingPlugin: SdkPlugin = {
     console.debug(`[StellarSplit] ${method} errored`, err);
   },
 };
+
+/** Built-in plugin that counts method calls per method name. */
+export class MetricsPlugin implements SdkPlugin {
+  readonly name = "MetricsPlugin";
+  private callCounts = new Map<SdkMethodName, number>();
+
+  getMetrics(): Record<string, number> {
+    const result: Record<string, number> = {};
+    for (const [method, count] of this.callCounts) {
+      result[method] = count;
+    }
+    return result;
+  }
+
+  resetMetrics(): void {
+    this.callCounts.clear();
+  }
+
+  afterCall<K extends SdkMethodName>(method: K, result: PluginResult<K>): PluginResult<K> {
+    this.callCounts.set(method, (this.callCounts.get(method) ?? 0) + 1);
+    return result;
+  }
+}

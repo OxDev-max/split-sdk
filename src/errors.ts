@@ -1578,6 +1578,38 @@ export class PassphraseMismatchError extends StellarSplitError {
   }
 }
 
+/**
+ * Thrown when the passphrase of the requested network preset does not match the
+ * passphrase reported by the live Soroban RPC endpoint, so the switch is
+ * rejected and the client stays on its current network.
+ *
+ * Carries both sides of the comparison so callers can surface them without
+ * parsing the message: `expected` is the preset passphrase and `actual` is what
+ * the RPC node reported.
+ */
+export class NetworkMismatchError extends StellarSplitError {
+  /** The passphrase configured by the requested network preset. */
+  readonly expected: string;
+  /** The passphrase reported by the live RPC endpoint. */
+  readonly actual: string;
+
+  constructor(expected: string, actual: string) {
+    super(
+      `Network passphrase mismatch: expected [${expected}] but the RPC node reported [${actual}].`,
+      "NETWORK_MISMATCH",
+      { expected, actual }
+    );
+    this.name = "NetworkMismatchError";
+    this.expected = expected;
+    this.actual = actual;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isNetworkMismatchError(err: unknown): err is NetworkMismatchError {
+  return err instanceof NetworkMismatchError;
+}
+
 // ---------------------------------------------------------------------------
 // Sequence cache errors
 // ---------------------------------------------------------------------------
@@ -2109,6 +2141,53 @@ export class StellarTomlFetchError extends StellarSplitError {
   }
 }
 
+/**
+ * Thrown when a TLS certificate fingerprint for an anchor HTTPS endpoint does
+ * not match the configured pinned fingerprint (#780).
+ *
+ * The fingerprint should be a colon-separated uppercase hex string in the
+ * standard `openssl` format, e.g. `"AA:BB:CC:..."`.
+ */
+export class CertificatePinningError extends StellarSplitError {
+  readonly domain: string;
+  readonly expectedFingerprint: string;
+  readonly actualFingerprint: string;
+
+  constructor(domain: string, expectedFingerprint: string, actualFingerprint: string) {
+    super(
+      `Certificate fingerprint mismatch for domain "${domain}": ` +
+        `expected "${expectedFingerprint}", got "${actualFingerprint}"`,
+      "CERTIFICATE_PINNING_ERROR",
+      { domain, expectedFingerprint, actualFingerprint },
+    );
+    this.name = "CertificatePinningError";
+    this.domain = domain;
+    this.expectedFingerprint = expectedFingerprint;
+    this.actualFingerprint = actualFingerprint;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * Thrown when a `stellar.toml` file carries a VERSION that is not listed in
+ * {@link SUPPORTED_TOML_VERSIONS} (#779).
+ */
+export class UnsupportedTomlVersionError extends StellarSplitError {
+  readonly encounteredVersion: string;
+
+  constructor(encounteredVersion: string) {
+    super(
+      `Unsupported stellar.toml VERSION "${encounteredVersion}". ` +
+        `Supported versions: ${JSON.stringify([2.0, 2.1])}`,
+      "UNSUPPORTED_TOML_VERSION",
+      { encounteredVersion },
+    );
+    this.name = "UnsupportedTomlVersionError";
+    this.encounteredVersion = encounteredVersion;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 /** Thrown when all channel accounts in the pool are busy and the acquire timeout elapses. */
 export class ChannelExhaustedError extends StellarSplitError {
   readonly poolSize: number;
@@ -2251,240 +2330,29 @@ export function isWalletConnectionTimeoutError(err: unknown): err is WalletConne
   return err instanceof WalletConnectionTimeoutError;
 }
 
-
 // ---------------------------------------------------------------------------
-// Issues #878 / #879 / #880 / #881 — Extended error taxonomy
+// Batch operations errors
 // ---------------------------------------------------------------------------
 
-/** Thrown when closeRound is called before the round end timestamp has passed. */
-export class RoundNotEndedError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly roundEnd: number;
+/** Thrown when a batch operation exceeds the maximum allowed size. */
+export class BatchTooLargeError extends StellarSplitError {
+  readonly batchSize: number;
+  readonly maxSize: number;
 
-  constructor(invoiceId: string, roundEnd: number, raw?: string) {
+  constructor(batchSize: number, maxSize: number = 20) {
     super(
-      `Round for invoice ${invoiceId} has not ended yet (ends at ${new Date(roundEnd * 1000).toISOString()})`,
-      "ROUND_NOT_ENDED",
-      { invoiceId, roundEnd },
-      raw
+      `Batch size ${batchSize} exceeds maximum of ${maxSize}`,
+      "BATCH_TOO_LARGE",
+      { batchSize, maxSize },
     );
-    this.name = "RoundNotEndedError";
-    this.invoiceId = invoiceId;
-    this.roundEnd = roundEnd;
+    this.name = "BatchTooLargeError";
+    this.batchSize = batchSize;
+    this.maxSize = maxSize;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
-export function isRoundNotEndedError(err: unknown): err is RoundNotEndedError {
-  return err instanceof RoundNotEndedError;
+export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
+  return err instanceof BatchTooLargeError;
 }
 
-/** Thrown when completeMilestone is called for an index that is not active. */
-export class WrongMilestoneError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly requestedIndex: number;
-  readonly activeIndex: number;
-
-  constructor(invoiceId: string, requestedIndex: number, activeIndex: number, raw?: string) {
-    super(
-      `Milestone ${requestedIndex} is not active for invoice ${invoiceId} (active: ${activeIndex})`,
-      "WRONG_MILESTONE",
-      { invoiceId, requestedIndex, activeIndex },
-      raw
-    );
-    this.name = "WrongMilestoneError";
-    this.invoiceId = invoiceId;
-    this.requestedIndex = requestedIndex;
-    this.activeIndex = activeIndex;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isWrongMilestoneError(err: unknown): err is WrongMilestoneError {
-  return err instanceof WrongMilestoneError;
-}
-
-/** Thrown when claimReferralRewards is called with a zero balance. */
-export class NothingToClaimError extends StellarSplitError {
-  readonly address: string;
-
-  constructor(address: string, raw?: string) {
-    super(
-      `No referral rewards to claim for address ${address}`,
-      "NOTHING_TO_CLAIM",
-      { address },
-      raw
-    );
-    this.name = "NothingToClaimError";
-    this.address = address;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isNothingToClaimError(err: unknown): err is NothingToClaimError {
-  return err instanceof NothingToClaimError;
-}
-
-/** Thrown when an invoice is expired (round_end / deadline already passed). */
-export class InvoiceExpiredError extends StellarSplitError {
-  readonly invoiceId: string;
-
-  constructor(invoiceId: string, raw?: string) {
-    super(`Invoice ${invoiceId} has expired`, "INVOICE_EXPIRED", { invoiceId }, raw);
-    this.name = "InvoiceExpiredError";
-    this.invoiceId = invoiceId;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isInvoiceExpiredError(err: unknown): err is InvoiceExpiredError {
-  return err instanceof InvoiceExpiredError;
-}
-
-/** Thrown when payer is not on the whitelist for a restricted invoice. */
-export class PayerNotWhitelistedError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly payer: string;
-
-  constructor(invoiceId: string, payer: string, raw?: string) {
-    super(
-      `Payer ${payer} is not whitelisted for invoice ${invoiceId}`,
-      "PAYER_NOT_WHITELISTED",
-      { invoiceId, payer },
-      raw
-    );
-    this.name = "PayerNotWhitelistedError";
-    this.invoiceId = invoiceId;
-    this.payer = payer;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isPayerNotWhitelistedError(err: unknown): err is PayerNotWhitelistedError {
-  return err instanceof PayerNotWhitelistedError;
-}
-
-/** Thrown when a payer's contribution exceeds their per-payer cap. */
-export class ContributionCapExceededError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly payer: string;
-  readonly cap: bigint;
-  readonly attempted: bigint;
-
-  constructor(invoiceId: string, payer: string, cap: bigint, attempted: bigint, raw?: string) {
-    super(
-      `Contribution cap exceeded for payer ${payer} on invoice ${invoiceId}: cap ${cap}, attempted ${attempted}`,
-      "CONTRIBUTION_CAP_EXCEEDED",
-      { invoiceId, payer, cap: cap.toString(), attempted: attempted.toString() },
-      raw
-    );
-    this.name = "ContributionCapExceededError";
-    this.invoiceId = invoiceId;
-    this.payer = payer;
-    this.cap = cap;
-    this.attempted = attempted;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isContributionCapExceededError(err: unknown): err is ContributionCapExceededError {
-  return err instanceof ContributionCapExceededError;
-}
-
-/**
- * Thrown when a payment is attempted during an active cooldown window.
- * Includes retryAfter so callers know when they may try again.
- */
-export class PaymentCooldownActiveError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly payer: string;
-  /** The earliest time after which the payer may retry. */
-  readonly retryAfter: Date;
-
-  constructor(invoiceId: string, payer: string, retryAfterTimestamp: number, raw?: string) {
-    const retryAfter = new Date(retryAfterTimestamp * 1000);
-    super(
-      `Payment cooldown active for payer ${payer} on invoice ${invoiceId}. Retry after ${retryAfter.toISOString()}`,
-      "PAYMENT_COOLDOWN_ACTIVE",
-      { invoiceId, payer, retryAfterTimestamp },
-      raw
-    );
-    this.name = "PaymentCooldownActiveError";
-    this.invoiceId = invoiceId;
-    this.payer = payer;
-    this.retryAfter = retryAfter;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isPaymentCooldownActiveError(err: unknown): err is PaymentCooldownActiveError {
-  return err instanceof PaymentCooldownActiveError;
-}
-
-/** Thrown when the contract is administratively frozen for all operations. */
-export class ContractFrozenError extends StellarSplitError {
-  constructor(raw?: string) {
-    super("Contract is frozen and not accepting operations", "CONTRACT_FROZEN", undefined, raw);
-    this.name = "ContractFrozenError";
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isContractFrozenError(err: unknown): err is ContractFrozenError {
-  return err instanceof ContractFrozenError;
-}
-
-/** Thrown when an invoice has been fully funded and cannot receive more payments. */
-export class InvoiceFullyFundedError extends StellarSplitError {
-  readonly invoiceId: string;
-
-  constructor(invoiceId: string, raw?: string) {
-    super(`Invoice ${invoiceId} is already fully funded`, "INVOICE_FULLY_FUNDED", { invoiceId }, raw);
-    this.name = "InvoiceFullyFundedError";
-    this.invoiceId = invoiceId;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isInvoiceFullyFundedError(err: unknown): err is InvoiceFullyFundedError {
-  return err instanceof InvoiceFullyFundedError;
-}
-
-/**
- * Returns true for errors that represent transient, retryable conditions
- * (e.g. RPC timeouts, cooldown windows) and false for permanent contract-
- * logic failures (e.g. wrong milestone, invoice not found).
- *
- * @example
- * ```ts
- * try {
- *   await client.pay(...);
- * } catch (err) {
- *   if (isRetryable(err)) {
- *     // schedule a retry
- *   } else {
- *     throw err; // surface to user
- *   }
- * }
- * ```
- */
-export function isRetryable(error: unknown): boolean {
-  if (error instanceof PaymentCooldownActiveError) return true;
-  if (error instanceof RpcError) return true;
-  if (error instanceof TransactionNotConfirmedError) return true;
-  if (error instanceof CircuitOpenError) return true;
-  // Permanent contract-logic errors
-  if (error instanceof RoundNotEndedError) return false;
-  if (error instanceof WrongMilestoneError) return false;
-  if (error instanceof NothingToClaimError) return false;
-  if (error instanceof InvoiceNotFoundError) return false;
-  if (error instanceof InvoiceExpiredError) return false;
-  if (error instanceof PayerNotWhitelistedError) return false;
-  if (error instanceof ContributionCapExceededError) return false;
-  if (error instanceof ContractFrozenError) return false;
-  if (error instanceof InvoiceFullyFundedError) return false;
-  if (error instanceof InvoiceFrozenError) return false;
-  if (error instanceof UnauthorizedError) return false;
-  // Default: non-retryable for unknown errors
-  return false;
-}

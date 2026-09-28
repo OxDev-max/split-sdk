@@ -245,3 +245,136 @@ export class Cache<V> {
     return Date.now() - entry.writtenAt > this.ttlMs;
   }
 }
+
+/**
+ * Outcome of a nonce deduplication check.
+ */
+export type NonceDedupOutcome = "accepted" | "duplicate";
+
+/**
+ * Event payload emitted for every nonce deduplication decision.
+ */
+export interface NonceDedupEvent {
+  /** The nonce that was evaluated. */
+  nonce: string;
+  /** Whether the request was accepted (first-seen) or rejected as a duplicate. */
+  outcome: NonceDedupOutcome;
+  /** Unix ms timestamp of the decision. */
+  timestamp: number;
+}
+
+/**
+ * Listener invoked whenever a nonce deduplication decision is made.
+ */
+export type NonceDedupListener = (event: NonceDedupEvent) => void;
+
+/**
+ * Configuration for {@link NonceDeduplicator}.
+ *
+ * Deduplication is **opt-in**: when `enabled` is omitted or `false` the
+ * deduplicator is a transparent pass-through and every nonce is accepted,
+ * preserving existing behaviour.
+ */
+export interface NonceDeduplicatorConfig {
+  /** Enable deduplication. Defaults to `false` (pass-through). */
+  enabled?: boolean;
+  /** Time-to-live in ms for a seen nonce. Defaults to 300_000 (5 minutes). */
+  ttlMs?: number;
+  /** Maximum number of tracked nonces before oldest-first eviction. Defaults to 1000. */
+  maxEntries?: number;
+}
+
+/**
+ * Optional request deduplication keyed by nonce.
+ *
+ * Tracks recently seen nonces so that a repeated request (same nonce) can be
+ * detected and rejected.  When disabled (the default) every nonce is accepted
+ * and no state is retained, so callers can adopt it without changing behaviour.
+ *
+ * Usage:
+ *   const dedup = new NonceDeduplicator({ enabled: true, ttlMs: 60_000 });
+ *   dedup.on("dedup", (e) => console.log(e.outcome));
+ *   if (dedup.check(nonce) === "duplicate") { ... }
+ */
+export class NonceDeduplicator {
+  private readonly enabled: boolean;
+  private readonly ttlMs: number;
+  private readonly maxEntries: number;
+  private readonly seen = new Map<string, number>();
+  private readonly listeners = new Set<NonceDedupListener>();
+
+  constructor(config?: NonceDeduplicatorConfig) {
+    this.enabled = config?.enabled ?? false;
+    this.ttlMs = config?.ttlMs ?? 300_000;
+    this.maxEntries = config?.maxEntries ?? 1000;
+  }
+
+  /**
+   * Evaluate `nonce` and record it when accepted.
+   *
+   * @returns `"duplicate"` when the nonce was seen within the TTL window,
+   *          otherwise `"accepted"`.  Always `"accepted"` when disabled.
+   */
+  check(nonce: string): NonceDedupOutcome {
+    if (!this.enabled) {
+      this.emit({ nonce, outcome: "accepted", timestamp: Date.now() });
+      return "accepted";
+    }
+
+    this.purgeExpired();
+
+    if (this.seen.has(nonce)) {
+      this.emit({ nonce, outcome: "duplicate", timestamp: Date.now() });
+      return "duplicate";
+    }
+
+    if (this.maxEntries > 0 && this.seen.size >= this.maxEntries) {
+      const oldest = this.seen.keys().next().value;
+      if (oldest !== undefined) this.seen.delete(oldest);
+    }
+
+    this.seen.set(nonce, Date.now() + this.ttlMs);
+    this.emit({ nonce, outcome: "accepted", timestamp: Date.now() });
+    return "accepted";
+  }
+
+  /** Convenience predicate: `true` when `nonce` is a duplicate. */
+  isDuplicate(nonce: string): boolean {
+    return this.check(nonce) === "duplicate";
+  }
+
+  /** Register a listener for deduplication decisions. */
+  on(_event: "dedup", listener: NonceDedupListener): void {
+    this.listeners.add(listener);
+  }
+
+  /** Remove a previously registered listener. */
+  off(_event: "dedup", listener: NonceDedupListener): void {
+    this.listeners.delete(listener);
+  }
+
+  /** Remove all tracked nonces. */
+  clear(): void {
+    this.seen.clear();
+  }
+
+  /** Number of nonces currently tracked (including not-yet-evicted expired ones). */
+  get size(): number {
+    return this.seen.size;
+  }
+
+  // ── private helpers ──────────────────────────────────────────────────────
+
+  private purgeExpired(): void {
+    const now = Date.now();
+    for (const [nonce, expiresAt] of this.seen) {
+      if (now > expiresAt) this.seen.delete(nonce);
+    }
+  }
+
+  private emit(event: NonceDedupEvent): void {
+    for (const listener of this.listeners) {
+      listener(event);
+    }
+  }
+}
