@@ -96,6 +96,9 @@ import { generatePaymentReceipt } from "./receipt.js";
 import type { PaymentReceipt } from "./receipt.js";
 import { checkInvoiceExpiry, checkPayerReadiness } from "./preflightChecker.js";
 import { InvoiceCloneabilityValidator } from "./preflight/InvoiceCloneabilityValidator.js";
+import { InvoiceQueryEngine } from "./invoiceQuery.js";
+import type { InvoiceFilter, InvoicePage } from "./invoiceQuery.js";
+
 import { createInvoiceSubscription } from "./subscription.js";
 import type { Subscription, InvoiceEvent, SubscriptionOptions, SimulationResult, LedgerFootprint } from "./types.js";
 import { getSubscriptionManager } from "./streaming/SubscriptionManager.js";
@@ -5283,6 +5286,68 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         return { items: page, nextCursor, total };
       },
     );
+  }
+
+  /**
+   * Query invoices with a rich, composable filter, sort and pagination.
+   *
+   * All filtering is applied client-side against the invoices the contract
+   * returns for `filter.creator` (or, when no creator is given, the full set
+   * of invoices the caller has already indexed locally). The result is a
+   * {@link InvoicePage} carrying a `nextCursor` for subsequent pages.
+   *
+   * Because the contract has no query endpoint for status/amount/date, this
+   * method fetches the candidate invoice IDs first and then applies every
+   * predicate in-memory — prefer supplying `creator` to bound the fetch.
+   *
+   * @param filter - The composed query. All supplied fields combine with AND.
+   * @returns A page of matching invoices plus a cursor when more remain.
+   * @throws {ValidationError} If the filter is inconsistent (e.g.
+   *   `minAmount > maxAmount`) or the cursor is malformed.
+   *
+   * @example
+   * ```ts
+   * const page = await client.queryInvoices({
+   *   creator: "GABC...",
+   *   status: ["Pending", "Released"],
+   *   minAmount: 1000n,
+   *   fromDate: Date.UTC(2026, 0, 1) / 1000,
+   *   tags: ["urgent"],
+   *   sort: "highest",
+   *   limit: 10,
+   * });
+   * ```
+   */
+  async queryInvoices(filter: InvoiceFilter = {}): Promise<InvoicePage> {
+    const startTime = Date.now();
+    try {
+      if (filter.creator === undefined) {
+        throw new ValidationError(
+          "queryInvoices requires a 'creator' — the contract has no global invoice index",
+        );
+      }
+
+      // Fetch every invoice ID for the creator (cursor-paging through the
+      // on-chain list) so filters are applied to the complete result set.
+      const ids: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page: PaginatedResult<string> = await this.getInvoicesByCreator(
+          filter.creator,
+          cursor !== undefined ? { cursor } : {},
+        );
+        ids.push(...page.items);
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor !== undefined);
+
+      const invoices = await Promise.all(ids.map((id) => this.getInvoice(id)));
+      const result = new InvoiceQueryEngine(invoices).query(filter);
+      telemetry.recordMethod("queryInvoices", true, Date.now() - startTime);
+      return result;
+    } catch (error) {
+      telemetry.recordMethod("queryInvoices", false, Date.now() - startTime);
+      throw error;
+    }
   }
 
   /**

@@ -903,6 +903,17 @@ export type { ReminderSchedule, ReminderEvent, ReminderStatus } from "./types.js
 export { compileFilter, applyFilter, FilterIndex } from "./invoiceFilter.js";
 export type { FilterCriteria, CompiledFilter } from "./invoiceFilter.js";
 
+// Invoice query engine — filter/sort/paginate invoices with one typed query
+export {
+  InvoiceQueryEngine,
+  InvoiceTagIndex,
+  queryInvoices,
+  getInvoiceTags,
+  INVOICE_SORTS,
+  DEFAULT_QUERY_LIMIT,
+} from "./invoiceQuery.js";
+export type { InvoiceFilter, InvoicePage, InvoiceSort } from "./invoiceQuery.js";
+
 // Invoice diff utility
 export { diffInvoices, hasDiff } from "./diff.js";
 export type { InvoiceDiff, InvoiceDiffEntry } from "./diff.js";

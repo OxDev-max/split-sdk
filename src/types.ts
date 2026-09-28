@@ -326,6 +326,15 @@ export interface Invoice {
   groupId?: string;
   /** Ledger sequence when this invoice was last modified. */
   lastModifiedLedger?: number;
+  /**
+   * Optional free-form labels used for tag-based querying via
+   * `client.queryInvoices({ tags: [...] })`.
+   *
+   * When omitted, the query engine falls back to parsing `#hashtags` out of
+   * `memo`, so invoices created with a tagged memo are queryable without any
+   * contract change.
+   */
+  tags?: string[];
   /** IDs of invoices that must be paid before this one. */
   prerequisites?: string[];
   /** ID of the parent invoice this was cloned from (clone chain). */
