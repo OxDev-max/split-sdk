@@ -21,6 +21,16 @@ interface TelemetryConfig {
   optOut?: boolean;
 }
 
+/**
+ * Aggregated counters for a single method, used for Prometheus export.
+ */
+interface MethodMetrics {
+  calls: number;
+  successes: number;
+  failures: number;
+  durationMsSum: number;
+}
+
 class Telemetry {
   private config: TelemetryConfig | null = null;
   private events: TelemetryEvent[] = [];
@@ -28,6 +38,8 @@ class Telemetry {
   private readonly FLUSH_INTERVAL_MS = 60000;
   /** Stack of active span IDs; the top is the current span for new events. */
   private spanStack: string[] = [];
+  /** Per-method aggregated metrics, keyed by method name. */
+  private metrics = new Map<string, MethodMetrics>();
 
   /**
    * Initialize telemetry with configuration.
@@ -107,6 +119,77 @@ class Telemetry {
       timestamp: Date.now(),
       parentSpanId: this.currentSpanId(),
     });
+
+    this.recordMetric(method, success, durationMs);
+  }
+
+  /**
+   * Update the aggregated per-method metrics for a recorded call.
+   */
+  private recordMetric(method: string, success: boolean, durationMs: number): void {
+    let entry = this.metrics.get(method);
+    if (!entry) {
+      entry = { calls: 0, successes: 0, failures: 0, durationMsSum: 0 };
+      this.metrics.set(method, entry);
+    }
+    entry.calls += 1;
+    if (success) {
+      entry.successes += 1;
+    } else {
+      entry.failures += 1;
+    }
+    entry.durationMsSum += durationMs;
+  }
+
+  /**
+   * Escape a Prometheus label value per the text exposition format.
+   */
+  private escapeLabelValue(value: string): string {
+    return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  }
+
+  /**
+   * Export the collected SDK metrics in the Prometheus text exposition format.
+   * Returns an empty string when telemetry is disabled or no metrics exist.
+   */
+  exportPrometheus(): string {
+    if (!this.config || this.config.optOut || this.metrics.size === 0) {
+      return "";
+    }
+
+    const lines: string[] = [];
+
+    lines.push("# HELP sdk_method_calls_total Total number of SDK method calls.");
+    lines.push("# TYPE sdk_method_calls_total counter");
+    for (const [method, m] of this.metrics) {
+      lines.push(`sdk_method_calls_total{method="${this.escapeLabelValue(method)}"} ${m.calls}`);
+    }
+
+    lines.push("# HELP sdk_method_successes_total Total number of successful SDK method calls.");
+    lines.push("# TYPE sdk_method_successes_total counter");
+    for (const [method, m] of this.metrics) {
+      lines.push(
+        `sdk_method_successes_total{method="${this.escapeLabelValue(method)}"} ${m.successes}`,
+      );
+    }
+
+    lines.push("# HELP sdk_method_failures_total Total number of failed SDK method calls.");
+    lines.push("# TYPE sdk_method_failures_total counter");
+    for (const [method, m] of this.metrics) {
+      lines.push(
+        `sdk_method_failures_total{method="${this.escapeLabelValue(method)}"} ${m.failures}`,
+      );
+    }
+
+    lines.push("# HELP sdk_method_duration_ms_sum Total duration of SDK method calls in milliseconds.");
+    lines.push("# TYPE sdk_method_duration_ms_sum counter");
+    for (const [method, m] of this.metrics) {
+      lines.push(
+        `sdk_method_duration_ms_sum{method="${this.escapeLabelValue(method)}"} ${m.durationMsSum}`,
+      );
+    }
+
+    return lines.join("\n") + "\n";
   }
 
   /**
