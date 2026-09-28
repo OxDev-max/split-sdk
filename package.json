@@ -58,6 +58,7 @@
     "test:all": "vitest run",
     "test:e2e": "vitest run test/e2e",
     "test:watch": "vitest",
+    "test:bench": "vitest bench --run",
     "lint": "tsc --noEmit",
     "changelog": "vite-node scripts/changelog.ts",
     "docs": "typedoc",
