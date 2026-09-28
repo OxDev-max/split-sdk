@@ -22,6 +22,7 @@ import type { CircuitStateChangeLogEvent } from "./resilience/CircuitBreaker.js"
 import { InvoiceStateMachine } from "./state/InvoiceStateMachine.js";
 import type { StateMachineConfig } from "./types/state.js";
 import { RpcLoadBalancer } from "./rpc/RpcLoadBalancer.js";
+import { OfflineQueue, type QueuedOperation } from "./offlineQueue.js";
 import type { EndpointConfig, RpcLoadBalancerOptions } from "./rpc/RpcLoadBalancer.js";
 
 /** Events emitted by {@link StellarSplitClient}. */
@@ -489,6 +490,7 @@ export interface StellarSplitClientConfig {
     /** Retry settings applied per RPC call (maxRetries, baseDelayMs, etc.). */
     retry?: Partial<ResilientRetryConfig>;
   };
+  offlineQueue?: import("./offlineQueue.js").OfflineQueueConfig;
   /**
    * Optional configuration for the CLOSED/OPEN/HALF_OPEN circuit breaker
    * (src/resilience/CircuitBreaker.ts) guarding the transaction-submission
@@ -709,6 +711,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * configs keep working unchanged; enable via `advancedCircuitBreaker`.
    */
   private _advancedCircuitBreaker: AdvancedCircuitBreaker | null = null;
+  private _offlineQueue: import("./offlineQueue.js").OfflineQueue | null = null;
   /** Optimistic UI cache for Invoice reads during a pending pay() call. */
   private _optimisticCache: OptimisticCache<Invoice> | null = null;
   private _sorobanFeatureDetector: SorobanFeatureDetector;
@@ -1263,6 +1266,14 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @returns The result of the method.
    * @throws {Error} If the method fails.
    */
+  getOfflineQueue(): import("./offlineQueue.js").QueuedOperation[] {
+    return this._offlineQueue ? this._offlineQueue.getQueue() : [];
+  }
+
+  clearOfflineQueue(): void {
+    if (this._offlineQueue) this._offlineQueue.clear();
+  }
+
   async switchTo(network: "mainnet" | "testnet" | "futurenet"): Promise<void> {
     const { NetworkSwitcher } = await import("./network/NetworkSwitcher.js");
     return NetworkSwitcher.switchTo(network, this);
@@ -5281,7 +5292,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @throws {Error} If the method fails.
    */
   async checkRPCHealth(): Promise<RPCHealth> {
-    return checkRPCHealth(this.server);
+    const health = await checkRPCHealth(this.server);
+    if (health.status !== "down" && this._offlineQueue?.config?.enabled) { void this._offlineQueue.drain(); }
+    return health;
   }
 
   /**
@@ -8230,6 +8243,38 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @returns The transaction hash.
    * @throws {Error} If the method fails.
    */
+    async release(invoiceId: string): Promise<TxResult> {
+    if (this._offlineQueue?.config?.enabled) {
+      try {
+        const health = await this.checkRPCHealth();
+        if (health.status === "down") {
+          this._offlineQueue.enqueue("release", [invoiceId]);
+          return { txHash: "queued" };
+        }
+      } catch (e) {
+        this._offlineQueue.enqueue("release", [invoiceId]);
+        return { txHash: "queued" };
+      }
+    }
+    throw new Error("Not implemented");
+  }
+
+  async cancel(invoiceId: string): Promise<TxResult> {
+    if (this._offlineQueue?.config?.enabled) {
+      try {
+        const health = await this.checkRPCHealth();
+        if (health.status === "down") {
+          this._offlineQueue.enqueue("cancel", [invoiceId]);
+          return { txHash: "queued" };
+        }
+      } catch (e) {
+        this._offlineQueue.enqueue("cancel", [invoiceId]);
+        return { txHash: "queued" };
+      }
+    }
+    throw new Error("Not implemented");
+  }
+
   async cancelAction(caller: string, actionId: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
