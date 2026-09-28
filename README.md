@@ -219,6 +219,20 @@ client.on("circuit:close", () => console.info("RPC circuit closed"));
 |-------|-------------|
 | `ProfilerSession` | Record SDK method timings during a session and produce a flame-graph-compatible report |
 
+`ProfilerSession` instruments both SDK methods and each client's Soroban RPC
+server, so RPC round-trips appear as frames nested inside the method that
+issued them. `report()` emits a **speedscope v0.6** file (validated with ajv
+against the published schema in the test suite); `exportJSON(path)` writes it
+to disk for drag-and-drop into [speedscope.app](https://www.speedscope.app).
+
+```ts
+const profiler = new ProfilerSession({ name: "my-session" });
+profiler.start();
+await client.pay({ invoiceId, payer });
+profiler.stop();
+profiler.exportJSON("./profile.json");
+```
+
 ### Webhook Validation
 
 | Function | Returns | Description |
