@@ -9,6 +9,17 @@ interface BreakerEntry {
   threshold: number;
 }
 
+export interface HealthCheckDiagnostics {
+  healthy: boolean;
+  totalBreakers: number;
+  openBreakers: string[];
+  halfOpenBreakers: string[];
+  closedBreakers: string[];
+  totalFailures: number;
+  breakers: CircuitBreakerStatus[];
+  checkedAt: number;
+}
+
 export class CircuitBreakerMonitor extends EventEmitter {
   private _breakers = new Map<string, BreakerEntry>();
 
@@ -63,6 +74,46 @@ export class CircuitBreakerMonitor extends EventEmitter {
       });
     }
     return out;
+  }
+
+  /**
+   * Perform a health check across all registered breakers and return
+   * detailed diagnostics. Emits "healthCheck" with the diagnostics and
+   * "healthCheckError" if the check itself throws.
+   */
+  healthCheck(): HealthCheckDiagnostics {
+    this.emit("healthCheckStart");
+    try {
+      const breakers = this.getStatus();
+      const openBreakers: string[] = [];
+      const halfOpenBreakers: string[] = [];
+      const closedBreakers: string[] = [];
+      let totalFailures = 0;
+
+      for (const b of breakers) {
+        totalFailures += b.failureCount;
+        if (b.state === "open") openBreakers.push(b.endpoint);
+        else if (b.state === "half-open") halfOpenBreakers.push(b.endpoint);
+        else closedBreakers.push(b.endpoint);
+      }
+
+      const diagnostics: HealthCheckDiagnostics = {
+        healthy: openBreakers.length === 0 && halfOpenBreakers.length === 0,
+        totalBreakers: breakers.length,
+        openBreakers,
+        halfOpenBreakers,
+        closedBreakers,
+        totalFailures,
+        breakers,
+        checkedAt: Date.now(),
+      };
+
+      this.emit("healthCheck", diagnostics);
+      return diagnostics;
+    } catch (err) {
+      this.emit("healthCheckError", err);
+      throw err;
+    }
   }
 
   /** Reset a breaker to closed state */

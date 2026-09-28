@@ -55,6 +55,8 @@ const STORAGE_KEY = "stellarsplit:wc:session";
  */
 export class WalletConnectAdapter implements WalletAdapter {
   private readonly opts: WalletConnectAdapterOptions;
+  private readonly delegations = new Map<string, SigningDelegation>();
+  private readonly listeners = new Set<SigningDelegationListener>();
 
   constructor(opts: WalletConnectAdapterOptions) {
     this.opts = opts;
@@ -68,6 +70,40 @@ export class WalletConnectAdapter implements WalletAdapter {
 
   async getAddress(): Promise<string> {
     return this.opts.address;
+  }
+
+  /**
+   * Authorize a custody solution to sign transactions on behalf of the
+   * connected wallet until `expiresAt` (Unix ms).
+   */
+  delegateSigning(delegate: string, expiresAt: number): SigningDelegation {
+    const delegation: SigningDelegation = { delegate, expiresAt };
+    this.delegations.set(delegate, delegation);
+    this.emit({ type: "delegation:created", delegate, expiresAt });
+    return delegation;
+  }
+
+  /** Revoke a previously granted signing delegation. */
+  revokeDelegation(delegate: string): boolean {
+    const removed = this.delegations.delete(delegate);
+    if (removed) {
+      this.emit({ type: "delegation:revoked", delegate });
+    }
+    return removed;
+  }
+
+  /** List currently active (non-expired) signing delegations. */
+  listDelegations(): SigningDelegation[] {
+    const now = Date.now();
+    return [...this.delegations.values()].filter((d) => d.expiresAt > now);
+  }
+
+  /** Subscribe to delegation lifecycle events. Returns an unsubscribe fn. */
+  onDelegation(listener: SigningDelegationListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   async signTransaction(xdr: string, network: string): Promise<string> {
