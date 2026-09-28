@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import * as fc from "fast-check";
 import { deadlineFromDays, isExpired } from "../src/utils.js";
+import {
+  deadlineFromDays as deadlineFromDaysBigInt,
+  isDeadlineValid,
+  timeUntilDeadline,
+} from "../src/deadline.js";
 
 describe("deadlineFromDays (property-based)", () => {
   it("returns a timestamp in the future for positive day counts", () => {
@@ -106,3 +111,69 @@ describe("deadlineFromDays (property-based)", () => {
     expect(Math.abs(deadline - now)).toBeLessThanOrEqual(2);
   });
 });
+
+describe("bigint deadline helpers (property-based)", () => {
+  const nowSeconds = () => BigInt(Math.floor(Date.now() / 1000));
+
+  it("deadlineFromDays(n) is always in the future for n > 0", () => {
+    fc.assert(
+      fc.property(
+        fc.double({ min: 1e-9, max: 3_650, noNaN: true, noDefaultInfinity: true }),
+        (days) => {
+          expect(deadlineFromDaysBigInt(days)).toBeGreaterThan(nowSeconds());
+        },
+      ),
+      { numRuns: 500, verbose: true },
+    );
+  });
+
+  it("isDeadlineValid matches the one-hour rule for arbitrary timestamps", () => {
+    fc.assert(
+      fc.property(fc.bigInt({ min: 0n, max: 4_102_444_800n }), (deadline) => {
+        expect(isDeadlineValid(deadline)).toBe(deadline - nowSeconds() >= 3_600n);
+      }),
+      { numRuns: 500, verbose: true },
+    );
+  });
+
+  it("timeUntilDeadline never reports negative units and flags expiry consistently", () => {
+    fc.assert(
+      fc.property(fc.bigInt({ min: 0n, max: 4_102_444_800n }), (deadline) => {
+        const remaining = timeUntilDeadline(deadline);
+        const diff = deadline - nowSeconds();
+
+        expect(remaining.expired).toBe(diff <= 0n);
+        expect(remaining.days).toBeGreaterThanOrEqual(0);
+        expect(remaining.hours).toBeGreaterThanOrEqual(0);
+        expect(remaining.hours).toBeLessThanOrEqual(23);
+        expect(remaining.minutes).toBeGreaterThanOrEqual(0);
+        expect(remaining.minutes).toBeLessThanOrEqual(59);
+        expect(remaining.seconds).toBeGreaterThanOrEqual(0);
+        expect(remaining.seconds).toBeLessThanOrEqual(59);
+      }),
+      { numRuns: 500, verbose: true },
+    );
+  });
+
+  it("timeUntilDeadline units reconstruct the remaining duration", () => {
+    fc.assert(
+      fc.property(fc.bigInt({ min: 1n, max: 4_102_444_800n }), (total) => {
+        const deadline = nowSeconds() + total;
+        const remaining = timeUntilDeadline(deadline);
+        const reconstructed =
+          BigInt(remaining.days) * 86_400n +
+          BigInt(remaining.hours) * 3_600n +
+          BigInt(remaining.minutes) * 60n +
+          BigInt(remaining.seconds);
+        const diff = deadline - nowSeconds();
+
+        expect(remaining.expired).toBe(false);
+        expect(reconstructed).toBeLessThanOrEqual(diff);
+        // Allow for the wall clock rolling to the next second mid-assertion.
+        expect(diff - reconstructed).toBeLessThanOrEqual(1n);
+      }),
+      { numRuns: 500, verbose: true },
+    );
+  });
+});
+
