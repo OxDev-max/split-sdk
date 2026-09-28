@@ -106,7 +106,13 @@ import type {
   CircuitBreakerStateSnapshot,
 } from "./resilience/CircuitBreaker.js";
 import type { WaterfallPlan } from "./types/routing.js";
-import { WaterfallInsufficientFundsError } from "./errors.js";
+import {
+  WaterfallInsufficientFundsError,
+  InvalidAttestationError,
+  AlreadyRatedError,
+  InvoiceNotReleasedForRatingError,
+  NotEligibleToVoteError,
+} from "./errors.js";
 import { OptimisticCache } from "./cache/OptimisticCache.js";
 import type { CommitFn, RollbackFn } from "./cache/OptimisticCache.js";
 import { getOptimisticInvoice } from "./optimistic.js";
@@ -168,6 +174,10 @@ import type {
   BridgePaymentParams,
   BridgePaymentRequest,
   SignedBridgeProof,
+  Attestation,
+  CreatorRating,
+  ExtensionStatus,
+  GroupStats,
 } from "./types.js";
 import {
   estimateBridgeFee as _estimateBridgeFee,
@@ -4989,6 +4999,248 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
     const result = await this._submitTx(creator, operation);
     return { txHash: result.txHash };
+  }
+
+  /**
+   * Attest an invoice with a statement.
+   * @param invoiceId - Invoice ID to attest
+   * @param statement - Attestation statement (max 256 chars)
+   * @param payer - Payer address
+   * @returns Transaction hash
+   * @throws {InvalidAttestationError} if statement exceeds 256 chars
+   * @throws {Error} If the method fails.
+   */
+  async attestInvoice(
+    invoiceId: string,
+    statement: string,
+    payer: string
+  ): Promise<TxResult> {
+    if (statement.length > 256) {
+      throw new InvalidAttestationError("Statement must not exceed 256 characters");
+    }
+
+    const operation = this.contract.call(
+      "attest_invoice",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(statement, { type: "string" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Revoke an attestation on an invoice.
+   * @param invoiceId - Invoice ID
+   * @param payer - Payer address
+   * @returns Transaction hash
+   * @throws {Error} If the method fails.
+   */
+  async revokeAttestation(invoiceId: string, payer: string): Promise<TxResult> {
+    const operation = this.contract.call(
+      "revoke_attestation",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get all attestations for an invoice.
+   * @param invoiceId - Invoice ID
+   * @returns Array of attestations
+   * @throws {Error} If the method fails.
+   */
+  async getAttestations(invoiceId: string): Promise<Attestation[]> {
+    const operation = this.contract.call(
+      "get_attestations",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Array<Record<string, unknown>>;
+    return raw.map((a) => ({
+      attester: a.attester as string,
+      statement: a.statement as string,
+      timestamp: BigInt(a.timestamp as string | number),
+      revoked: Boolean(a.revoked),
+    }));
+  }
+
+  /**
+   * Create a campaign group.
+   * @param creator - Creator address
+   * @param name - Group name
+   * @param description - Group description
+   * @returns Group ID and transaction hash
+   * @throws {Error} If the method fails.
+   */
+  async createGroup(
+    creator: string,
+    name: string,
+    description: string
+  ): Promise<{ groupId: string; txHash: string }> {
+    const operation = this.contract.call(
+      "create_group",
+      nativeToScVal(creator, { type: "address" }),
+      nativeToScVal(name, { type: "string" }),
+      nativeToScVal(description, { type: "string" })
+    );
+
+    const result = await this._submitTx(creator, operation);
+    const groupId = scValToNative(result.returnValue).toString();
+    return { groupId, txHash: result.txHash };
+  }
+
+  /**
+   * Add an invoice to a group.
+   * @param creator - Creator address
+   * @param groupId - Group ID
+   * @param invoiceId - Invoice ID to add
+   * @returns Transaction hash
+   * @throws {Error} If caller is not the group owner or other errors.
+   */
+  async addInvoiceToGroup(
+    creator: string,
+    groupId: string,
+    invoiceId: string
+  ): Promise<TxResult> {
+    const operation = this.contract.call(
+      "add_invoice_to_group",
+      nativeToScVal(creator, { type: "address" }),
+      nativeToScVal(BigInt(groupId), { type: "u64" }),
+      nativeToScVal(BigInt(invoiceId), { type: "u64" })
+    );
+
+    const result = await this._submitTx(creator, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get statistics for a group.
+   * @param groupId - Group ID
+   * @returns Group statistics
+   * @throws {Error} If the method fails.
+   */
+  async getGroupStats(groupId: string): Promise<GroupStats> {
+    const operation = this.contract.call(
+      "get_group_stats",
+      nativeToScVal(BigInt(groupId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+    return {
+      name: raw.name as string,
+      totalTarget: BigInt(raw.totalTarget as string | number),
+      totalFunded: BigInt(raw.totalFunded as string | number),
+      invoiceCount: BigInt(raw.invoiceCount as string | number),
+      fullyFundedCount: BigInt(raw.fullyFundedCount as string | number),
+    };
+  }
+
+  /**
+   * Get invoices in a group.
+   * @param groupId - Group ID
+   * @returns Array of invoice IDs in the group
+   * @throws {Error} If the method fails.
+   */
+  async getGroupInvoices(groupId: string): Promise<bigint[]> {
+    const operation = this.contract.call(
+      "get_group_invoices",
+      nativeToScVal(BigInt(groupId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as (string | number)[];
+    return raw.map((id) => BigInt(id));
+  }
+
+  /**
+   * Vote to extend a deadline.
+   * @param invoiceId - Invoice ID
+   * @param payer - Payer address (must be a contributor)
+   * @returns Transaction hash
+   * @throws {NotEligibleToVoteError} if caller has not contributed
+   * @throws {Error} If the method fails.
+   */
+  async voteExtendDeadline(invoiceId: string, payer: string): Promise<TxResult> {
+    const operation = this.contract.call(
+      "vote_extend_deadline",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get deadline extension status for an invoice.
+   * @param invoiceId - Invoice ID
+   * @returns Extension status
+   * @throws {Error} If the method fails.
+   */
+  async getExtensionStatus(invoiceId: string): Promise<ExtensionStatus> {
+    const operation = this.contract.call(
+      "get_extension_status",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+    return {
+      voteCount: BigInt(raw.voteCount as string | number),
+      quorumRequired: BigInt(raw.quorumRequired as string | number),
+      extensionCount: BigInt(raw.extensionCount as string | number),
+      maxExtensions: BigInt(raw.maxExtensions as string | number),
+      currentDeadline: BigInt(raw.currentDeadline as string | number),
+    };
+  }
+
+  /**
+   * Rate an invoice.
+   * @param invoiceId - Invoice ID to rate
+   * @param stars - Star rating (1-5)
+   * @param payer - Payer address
+   * @returns Transaction hash
+   * @throws {InvoiceNotReleasedForRatingError} if invoice is not released
+   * @throws {AlreadyRatedError} if caller has already rated
+   * @throws {Error} If the method fails.
+   */
+  async rateInvoice(invoiceId: string, stars: 1 | 2 | 3 | 4 | 5, payer: string): Promise<TxResult> {
+    const operation = this.contract.call(
+      "rate_invoice",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(BigInt(stars), { type: "u32" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get the creator's rating information.
+   * @param creator - Creator address
+   * @returns Creator rating with total ratings and average stars
+   * @throws {Error} If the method fails.
+   */
+  async getCreatorRating(creator: string): Promise<CreatorRating> {
+    const operation = this.contract.call(
+      "get_creator_rating",
+      nativeToScVal(creator, { type: "address" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+    const totalRatings = BigInt(raw.totalRatings as string | number);
+    const totalStars = BigInt(raw.totalStars as string | number);
+    const averageStars =
+      totalRatings > 0n ? Number(totalStars) / Number(totalRatings) : 0;
+
+    return {
+      totalRatings,
+      averageStars,
+    };
   }
 
   /**
