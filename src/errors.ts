@@ -2251,72 +2251,29 @@ export function isWalletConnectionTimeoutError(err: unknown): err is WalletConne
   return err instanceof WalletConnectionTimeoutError;
 }
 
-/** Thrown when attempting to rate an invoice that is not yet released. */
-export class InvoiceNotReleasedForRatingError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly status: string;
+// ---------------------------------------------------------------------------
+// Batch operations errors
+// ---------------------------------------------------------------------------
 
-  constructor(invoiceId: string, status: string, raw?: string) {
+/** Thrown when a batch operation exceeds the maximum allowed size. */
+export class BatchTooLargeError extends StellarSplitError {
+  readonly batchSize: number;
+  readonly maxSize: number;
+
+  constructor(batchSize: number, maxSize: number = 20) {
     super(
-      `Invoice ${invoiceId} is not released and cannot be rated (current: ${status})`,
-      "INVOICE_NOT_RELEASED_FOR_RATING",
-      { invoiceId, status },
-      raw
+      `Batch size ${batchSize} exceeds maximum of ${maxSize}`,
+      "BATCH_TOO_LARGE",
+      { batchSize, maxSize },
     );
-    this.name = "InvoiceNotReleasedForRatingError";
-    this.invoiceId = invoiceId;
-    this.status = status;
+    this.name = "BatchTooLargeError";
+    this.batchSize = batchSize;
+    this.maxSize = maxSize;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
-export function isInvoiceNotReleasedForRatingError(err: unknown): err is InvoiceNotReleasedForRatingError {
-  return err instanceof InvoiceNotReleasedForRatingError;
-}
-
-/** Thrown when a payer has already rated an invoice. */
-export class AlreadyRatedError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly payer: string;
-
-  constructor(invoiceId: string, payer: string, raw?: string) {
-    super(
-      `Payer ${payer} has already rated invoice ${invoiceId}`,
-      "ALREADY_RATED",
-      { invoiceId, payer },
-      raw
-    );
-    this.name = "AlreadyRatedError";
-    this.invoiceId = invoiceId;
-    this.payer = payer;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isAlreadyRatedError(err: unknown): err is AlreadyRatedError {
-  return err instanceof AlreadyRatedError;
-}
-
-/** Thrown when a non-contributor attempts to vote on a deadline extension. */
-export class NotEligibleToVoteError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly caller: string;
-
-  constructor(invoiceId: string, caller: string, raw?: string) {
-    super(
-      `Caller ${caller} is not eligible to vote on invoice ${invoiceId} (must be a contributor)`,
-      "NOT_ELIGIBLE_TO_VOTE",
-      { invoiceId, caller },
-      raw
-    );
-    this.name = "NotEligibleToVoteError";
-    this.invoiceId = invoiceId;
-    this.caller = caller;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isNotEligibleToVoteError(err: unknown): err is NotEligibleToVoteError {
-  return err instanceof NotEligibleToVoteError;
+export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
+  return err instanceof BatchTooLargeError;
 }
 

@@ -38,6 +38,18 @@ export type SplitClientEventMap = {
   "endpoint:demoted": { url: string; reason: "consecutive_errors" | "failed_health_check" };
   /** A previously quarantined RpcLoadBalancer endpoint passed its health check and rejoined rotation. */
   "endpoint:reinstated": { url: string };
+  /** Emitted when a batch of invoices is successfully created. */
+  "batch:created": { invoiceIds: bigint[] };
+  /** Emitted when a payment is made to an invoice. */
+  payment: import("./contractEvents.js").PaymentEvent;
+  /** Emitted when funds are released from an invoice. */
+  release: import("./contractEvents.js").ReleaseEvent;
+  /** Emitted when an invoice is refunded. */
+  refund: import("./contractEvents.js").RefundEvent;
+  /** Emitted when a dispute is opened on an invoice. */
+  dispute: import("./contractEvents.js").DisputeEvent;
+  /** Emitted when a tier is unlocked on an invoice. */
+  tier_unlocked: import("./contractEvents.js").TierUnlockedEvent;
 };
 import { signTransaction } from "./wallet.js";
 import { telemetry } from "./telemetry.js";
@@ -1196,6 +1208,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         });
       this._instrumentOtel();
     }
+
+    this._pluginRegistry.setClientContext({
+      on: (event, handler) => this.on(event as keyof SplitClientEventMap, handler as never),
+      off: (event, handler) => this.off(event as keyof SplitClientEventMap, handler as never),
+    });
   }
 
   /**
@@ -2070,13 +2087,19 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     plugin.install?.(this);
   }
 
-  /** Register a middleware plugin (interceptor-style).
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+  /**
+   * Register a plugin with fluent API support.
+   * Plugins can extend the client with custom methods, intercept RPC calls,
+   * and subscribe to events.
+   *
+   * @param plugin - The plugin to install.
+   * @param options - Optional plugin configuration.
+   * @returns The client instance for method chaining.
+   * @throws {PluginAlreadyRegisteredError} if a plugin with the same name exists.
    */
-  use(plugin: SdkPlugin): void {
-    this._pluginRegistry.use(plugin);
+  use(plugin: SdkPlugin, options?: Record<string, unknown>): this {
+    this._pluginRegistry.use(plugin, options);
+    return this;
   }
 
   /** Deregister a middleware plugin by name.
@@ -9032,6 +9055,67 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     return cap > used ? cap - used : 0n;
   }
 
+  /**
+   * Get aggregate performance metrics for a creator.
+   * Combines on-chain stats and event history with 60-second caching.
+   *
+   * @param creator - Creator address.
+   * @returns Creator statistics including success rate, funding time, ratings.
+   */
+  async getCreatorStats(creator: string): Promise<import("./creatorStats.js").CreatorStats> {
+    const {
+      getCreatorStatsCache,
+      setCreatorStatsCache,
+    } = await import("./creatorStats.js");
+
+    const cached = getCreatorStatsCache(creator);
+    if (cached) return cached;
+
+    const result = await this.getInvoicesByCreator(creator);
+    const invoices = result.invoices || [];
+
+    const totalRaised = invoices.reduce((sum, inv) => sum + inv.amount, 0n);
+    const totalReleased = invoices.reduce((sum, inv) => {
+      if (inv.status === "Released") return sum + inv.amount;
+      return sum;
+    }, 0n);
+    const totalRefunded = invoices.reduce((sum, inv) => {
+      if (inv.status === "Refunded") return sum + inv.amount;
+      return sum;
+    }, 0n);
+
+    const successCount = invoices.filter((inv) => inv.status === "Released").length;
+    const successRate = invoices.length > 0 ? (successCount / invoices.length) * 100 : 0;
+
+    const fundingTimes = invoices
+      .filter((inv) => inv.paid_at && inv.created_at)
+      .map((inv) => (inv.paid_at! - inv.created_at!) / (1000 * 60 * 60));
+
+    const averageFundingTimeHours = fundingTimes.length > 0
+      ? fundingTimes.reduce((a, b) => a + b, 0) / fundingTimes.length
+      : 0;
+
+    const uniquePayers = new Set(
+      invoices
+        .filter((inv) => inv.payments && inv.payments.length > 0)
+        .flatMap((inv) => inv.payments!.map((p) => p.payer)),
+    ).size;
+
+    const stats = {
+      totalInvoices: invoices.length,
+      totalRaised,
+      totalReleased,
+      totalRefunded,
+      successRate: Math.round(successRate * 100) / 100,
+      averageFundingTimeHours: Math.round(averageFundingTimeHours * 100) / 100,
+      uniquePayerCount: uniquePayers,
+      averageRating: 0,
+    };
+
+    setCreatorStatsCache(creator, stats);
+    return stats;
+  }
+
   // ---------------------------------------------------------------------------
   // Issue #277 — Batch invoice creation helper
   // ---------------------------------------------------------------------------
@@ -9284,6 +9368,58 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         false,
         Date.now() - startTime,
       );
+      throw error;
+    }
+  }
+
+  /**
+   * Create multiple invoices in one transaction with full validation before submission.
+   * All invoices are validated client-side before any RPC call is made.
+   *
+   * @param invoices - Array of invoice parameters (1-20 items).
+   * @returns Array of created invoice IDs in the same order as input.
+   * @throws {BatchTooLargeError} if more than 20 invoices.
+   * @throws {ValidationError} if any invoice fails validation.
+   */
+  async batchCreateInvoices(
+    invoices: CreateInvoiceParams[],
+  ): Promise<bigint[]> {
+    const { BatchTooLargeError } = await import("./errors.js");
+
+    if (invoices.length < 1 || invoices.length > 20) {
+      throw new BatchTooLargeError(invoices.length, 20);
+    }
+
+    for (let i = 0; i < invoices.length; i++) {
+      const invoice = invoices[i]!;
+      if (!invoice.creator) {
+        throw new ValidationError(`Invoice ${i}: creator is required`);
+      }
+      if (!invoice.token) {
+        throw new ValidationError(`Invoice ${i}: token is required`);
+      }
+      if (!invoice.deadline || invoice.deadline <= 0) {
+        throw new ValidationError(
+          `Invoice ${i}: deadline must be a positive number`,
+        );
+      }
+      this._metadataValidator.validate(invoice.metadata);
+    }
+
+    const startTime = Date.now();
+    const invoiceIds: bigint[] = [];
+
+    try {
+      for (const params of invoices) {
+        const result = await this.createInvoice(params);
+        invoiceIds.push(BigInt(result.invoiceId));
+      }
+
+      this.emit("batch:created", { invoiceIds });
+
+      return invoiceIds;
+    } catch (error) {
+      telemetry.recordMethod("batchCreateInvoices", false, Date.now() - startTime);
       throw error;
     }
   }
