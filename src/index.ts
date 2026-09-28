@@ -1,5 +1,8 @@
 /**
- * @stellar-split/sdk — public API (core exports)
+ * SDK entry point.
+ *
+ * Exposes the public surface of the SDK along with a lightweight caching
+ * layer that supports per-entry TTLs and explicit invalidation.
  */
 
 import type { Invoice } from "./types.js";
