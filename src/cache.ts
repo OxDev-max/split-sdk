@@ -11,6 +11,9 @@ export interface CacheStats {
   size: number;
   keys: string[];
   evictions: number;
+  compressions: number;
+  decompressions: number;
+  bytesSaved: number;
 }
 
 export interface MethodCacheEntry {
@@ -35,6 +38,9 @@ export class SimpleCache<T> {
   private hits = 0;
   private misses = 0;
   private evictions = 0;
+  private compressions = 0;
+  private decompressions = 0;
+  private bytesSaved = 0;
   private maxEntries: number;
   private readonly listeners = new Set<CacheEventListener>();
 
@@ -43,6 +49,7 @@ export class SimpleCache<T> {
       this.enabled = true;
       this.maxEntries = 1000;
       this.ttlConfig = { default: config };
+      this.compressor = undefined;
     } else {
       this.enabled = config?.enabled ?? (config?.ttl !== undefined || config?.ttlMs !== undefined);
       this.maxEntries = config?.maxEntries ?? (this.enabled ? 1000 : 0);
@@ -50,6 +57,31 @@ export class SimpleCache<T> {
       if (config?.ttlMs !== undefined) {
         this.ttlConfig["default"] = config.ttlMs;
       }
+      const compression = config?.compression;
+      if (compression === true) {
+        this.compressor = new CacheCompressor();
+      } else if (compression && typeof compression === "object" && compression.enabled) {
+        this.compressor = new CacheCompressor(compression.threshold);
+      } else {
+        this.compressor = undefined;
+      }
+    }
+  }
+
+  /** Register a listener for cache lifecycle events. */
+  on(listener: CacheEventListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  /** Remove a previously registered listener. */
+  off(listener: CacheEventListener): void {
+    this.listeners.delete(listener);
+  }
+
+  private emit(event: CacheEvent): void {
+    for (const listener of this.listeners) {
+      listener(event);
     }
     this.debug = new DebugMode(
       typeof config === "object" && config?.debug !== undefined
@@ -99,7 +131,7 @@ export class SimpleCache<T> {
       this.emit("miss", key);
       return undefined;
     }
-    
+
     // Update LRU order
     this.store.delete(key);
     this.store.set(key, entry);
@@ -144,13 +176,13 @@ export class SimpleCache<T> {
       }
       return;
     }
-    
+
     // Check if it's an exact key
     if (this.store.has(methodOrKey)) {
       this.store.delete(methodOrKey);
       this.emit("invalidate", methodOrKey);
     }
-    
+
     // Invalidate by method prefix
     const prefix = `${methodOrKey}:`;
     for (const key of this.store.keys()) {
@@ -181,6 +213,9 @@ export class SimpleCache<T> {
       size: this.store.size,
       keys: Array.from(this.store.keys()),
       evictions: this.evictions,
+      compressions: this.compressions,
+      decompressions: this.decompressions,
+      bytesSaved: this.bytesSaved,
     };
   }
 
@@ -188,7 +223,7 @@ export class SimpleCache<T> {
     const now = Date.now();
     const result = new Map<string, T>();
     for (const [key, entry] of this.store) {
-      if (now <= entry.expiresAt) result.set(key, entry.value);
+      if (now <= entry.expiresAt) result.set(key, this.decode(entry.value));
     }
     return result;
   }
@@ -197,6 +232,40 @@ export class SimpleCache<T> {
     this.store.clear();
     for (const [key, value] of next) {
       this.set(key, value);
+    }
+  }
+
+  // ── compression helpers ──────────────────────────────────────────────────
+
+  private encode(value: T): any {
+    if (!this.compressor) return value;
+    let payload: string;
+    try {
+      payload = JSON.stringify(value);
+    } catch {
+      return value;
+    }
+    if (payload === undefined || !this.compressor.shouldCompress(payload)) {
+      return value;
+    }
+    const compressed = this.compressor.compress(payload);
+    if (compressed.length >= payload.length) return value;
+    this.compressions++;
+    this.bytesSaved += payload.length - compressed.length;
+    this.emit({ type: "compress", size: compressed.length, bytesSaved: payload.length - compressed.length });
+    return { __compressed: true, data: compressed };
+  }
+
+  private decode(value: any): T {
+    if (!this.compressor || value === null || typeof value !== "object" || !(value as any).__compressed) {
+      return value as T;
+    }
+    this.decompressions++;
+    this.emit({ type: "decompress", size: (value as any).data?.length });
+    try {
+      return JSON.parse(this.compressor.decompress((value as any).data)) as T;
+    } catch {
+      return value as T;
     }
   }
 }

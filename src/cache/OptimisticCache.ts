@@ -81,6 +81,81 @@ interface FreshnessEntry<T> {
 }
 
 const DEFAULT_BASE_TTL_MS = 60_000;
+const DEFAULT_COMPRESSION_THRESHOLD_BYTES = 256;
+
+function isCompressedRecord(value: unknown): value is CompressedRecord {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { __compressed?: unknown }).__compressed === true &&
+    typeof (value as { data?: unknown }).data === "string"
+  );
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
+  if (typeof btoa === "function") return btoa(binary);
+  // Node fallback without depending on Buffer typings.
+  const g = globalThis as { Buffer?: { from(input: string, enc: string): { toString(enc: string): string } } };
+  if (g.Buffer) return g.Buffer.from(binary, "binary").toString("base64");
+  return binary;
+}
+
+function fromBase64(data: string): Uint8Array {
+  let binary: string;
+  if (typeof atob === "function") {
+    binary = atob(data);
+  } else {
+    const g = globalThis as { Buffer?: { from(input: string, enc: string): { toString(enc: string): string } } };
+    binary = g.Buffer ? g.Buffer.from(data, "base64").toString("binary") : data;
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * Synchronous fallback codec used when the platform lacks CompressionStream.
+ * Uses a run-length encoding over the UTF-8 bytes, which is lossless and
+ * still shrinks repetitive JSON payloads.
+ */
+function rleEncode(bytes: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  let i = 0;
+  while (i < bytes.length) {
+    const value = bytes[i]!;
+    let run = 1;
+    while (i + run < bytes.length && bytes[i + run] === value && run < 255) run++;
+    out.push(run, value);
+    i += run;
+  }
+  return new Uint8Array(out);
+}
+
+function rleDecode(bytes: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  for (let i = 0; i + 1 < bytes.length; i += 2) {
+    const run = bytes[i]!;
+    const value = bytes[i + 1]!;
+    for (let r = 0; r < run; r++) out.push(value);
+  }
+  return new Uint8Array(out);
+}
+
+function utf8Encode(text: string): Uint8Array {
+  if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text);
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
+  return bytes;
+}
+
+function utf8Decode(bytes: Uint8Array): string {
+  if (typeof TextDecoder !== "undefined") return new TextDecoder().decode(bytes);
+  let text = "";
+  for (let i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]!);
+  return text;
+}
 
 export class OptimisticCache<T = unknown> {
   private readonly base: SimpleCache<T>;
