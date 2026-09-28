@@ -2152,34 +2152,65 @@ export interface ClaimableBalanceRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Pause/Resume Types (Issue #866)
+// Invoice Rating Types (Issue #865)
 // ---------------------------------------------------------------------------
 
-export interface PauseStatus {
-  paused: boolean;
-  autoResumeAt?: Date;
+/** Creator rating information. */
+export interface CreatorRating {
+  /** Total number of ratings received by the creator. */
+  totalRatings: bigint;
+  /** Average star rating as a float (e.g. 4.3). */
+  averageStars: number;
 }
 
 // ---------------------------------------------------------------------------
-// Pledge Match Types (Issue #867)
+// Deadline Extension Types (Issue #864)
 // ---------------------------------------------------------------------------
 
-export interface MatchPledge {
-  matcher: string;
-  pledgedAmount: bigint;
-  matchedAmount: bigint;
-  unmatched: bigint;
+/** Extension status for an invoice deadline. */
+export interface ExtensionStatus {
+  /** Current number of votes for extension. */
+  voteCount: bigint;
+  /** Minimum number of votes required (quorum). */
+  quorumRequired: bigint;
+  /** Number of times the deadline has been extended. */
+  extensionCount: bigint;
+  /** Maximum allowed extensions. */
+  maxExtensions: bigint;
+  /** Current deadline timestamp. */
+  currentDeadline: bigint;
 }
 
 // ---------------------------------------------------------------------------
-// Streaming Types (Issue #868)
+// Group Management Types (Issue #863)
 // ---------------------------------------------------------------------------
 
-export interface Stream {
-  id: string;
-  invoiceId: string;
-  payer: string;
-  amountPerLedger: bigint;
-  startLedger: number;
-  status: "active" | "settled" | "cancelled";
+/** Statistics for an invoice group. */
+export interface GroupStats {
+  /** Group name. */
+  name: string;
+  /** Total target amount for all invoices in the group. */
+  totalTarget: bigint;
+  /** Total funded amount for all invoices in the group. */
+  totalFunded: bigint;
+  /** Number of invoices in the group. */
+  invoiceCount: bigint;
+  /** Number of fully funded invoices in the group. */
+  fullyFundedCount: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Attestation Types (Issue #862)
+// ---------------------------------------------------------------------------
+
+/** Invoice attestation record. */
+export interface Attestation {
+  /** Address of the attester. */
+  attester: string;
+  /** Attestation statement (max 256 chars). */
+  statement: string;
+  /** Unix timestamp when the attestation was created. */
+  timestamp: bigint;
+  /** Whether the attestation has been revoked. */
+  revoked: boolean;
 }

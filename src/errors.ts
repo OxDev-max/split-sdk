@@ -2251,43 +2251,29 @@ export function isWalletConnectionTimeoutError(err: unknown): err is WalletConne
   return err instanceof WalletConnectionTimeoutError;
 }
 
-/** Thrown when attempting to pledge on a fully funded invoice. */
-export class InvoiceFullyFundedError extends StellarSplitError {
-  readonly invoiceId: string;
+// ---------------------------------------------------------------------------
+// Batch operations errors
+// ---------------------------------------------------------------------------
 
-  constructor(invoiceId: string) {
-    super(`Invoice ${invoiceId} is already fully funded`, "INVOICE_FULLY_FUNDED", {
-      invoiceId,
-    });
-    this.name = "InvoiceFullyFundedError";
-    this.invoiceId = invoiceId;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
+/** Thrown when a batch operation exceeds the maximum allowed size. */
+export class BatchTooLargeError extends StellarSplitError {
+  readonly batchSize: number;
+  readonly maxSize: number;
 
-export function isInvoiceFullyFundedError(err: unknown): err is InvoiceFullyFundedError {
-  return err instanceof InvoiceFullyFundedError;
-}
-
-/** Thrown when delegate limit is reached. */
-export class DelegateLimitReachedError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly limit: number;
-
-  constructor(invoiceId: string, limit: number = 3) {
+  constructor(batchSize: number, maxSize: number = 20) {
     super(
-      `Invoice ${invoiceId} has reached the delegate limit of ${limit}`,
-      "DELEGATE_LIMIT_REACHED",
-      { invoiceId, limit },
+      `Batch size ${batchSize} exceeds maximum of ${maxSize}`,
+      "BATCH_TOO_LARGE",
+      { batchSize, maxSize },
     );
-    this.name = "DelegateLimitReachedError";
-    this.invoiceId = invoiceId;
-    this.limit = limit;
+    this.name = "BatchTooLargeError";
+    this.batchSize = batchSize;
+    this.maxSize = maxSize;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
-export function isDelegateLimitReachedError(err: unknown): err is DelegateLimitReachedError {
-  return err instanceof DelegateLimitReachedError;
+export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
+  return err instanceof BatchTooLargeError;
 }
 
