@@ -96,7 +96,7 @@ import type { PaymentReceipt } from "./receipt.js";
 import { checkInvoiceExpiry, checkPayerReadiness } from "./preflightChecker.js";
 import { InvoiceCloneabilityValidator } from "./preflight/InvoiceCloneabilityValidator.js";
 import { createInvoiceSubscription } from "./subscription.js";
-import type { Subscription, InvoiceEvent, SubscriptionOptions } from "./types.js";
+import type { Subscription, InvoiceEvent, SubscriptionOptions, SimulationResult, LedgerFootprint } from "./types.js";
 import { getSubscriptionManager } from "./streaming/SubscriptionManager.js";
 import { destroySubscriptionManager } from "./streaming/SubscriptionManager.js";
 import type { SubscriptionOptions as SubscriptionManagerOptions } from "./types/events.js";
@@ -138,6 +138,7 @@ import type {
   InvoiceEventCallbacks,
   InvoiceExt,
   InvoiceGroup,
+  InvoiceParamOverrides,
   InvoiceReceipt,
   InvoiceStatus,
   PaginatedResult,
@@ -2564,8 +2565,21 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @throws {Error} If the method fails.
    */
   async createInvoice(
+    params: CreateInvoiceParams & { simulate: true },
+  ): Promise<SimulationResult>;
+  async createInvoice(
     params: CreateInvoiceParams,
-  ): Promise<{ invoiceId: string; txHash: string }> {
+  ): Promise<{ invoiceId: string; txHash: string }>;
+  async createInvoice(
+    params: CreateInvoiceParams,
+  ): Promise<{ invoiceId: string; txHash: string } | SimulationResult> {
+    // Issue #844 — `{ simulate: true }` performs a dry-run instead of submitting.
+    if (params.simulate) {
+      return this.simulate(
+        "create_invoice",
+        params as unknown as Record<string, unknown>,
+      );
+    }
     return this._withTelemetry(
       "createInvoice",
       {
@@ -2745,11 +2759,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @throws {InvoiceNotFoundError} If the source invoice does not exist.
    */
   async cloneInvoice(
-    sourceId: string,
-    overrides: CloneOverrides = {},
+    sourceId: string | bigint,
+    rawOverrides: CloneOverrides & InvoiceParamOverrides = {},
   ): Promise<string> {
     const startTime = Date.now();
-    const sourceInvoice = await this.getInvoice(sourceId);
+    const sourceInvoice = await this.getInvoice(sourceId.toString());
+    const overrides = this._normalizeCloneOverrides(
+      rawOverrides,
+      sourceInvoice.recipients.length,
+    );
 
     // -------------------------------------------------------------------
     // Cloneability pre-flight validation (#486)
@@ -2826,15 +2844,19 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
           key: nativeToScVal("new_recipients", { type: "symbol" }) as xdr.ScVal,
           val: xdr.ScVal.scvVec(
             overrides.newRecipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
               nativeToScVal(r, { type: "address" }),
             ),
           ) as xdr.ScVal,
+        }),
+      );
+    }
+    // Optional title override (issue #850). Serialised as `new_title`; the
+    // contract ignores unknown override keys, so older deployments are safe.
+    if (overrides.newTitle !== undefined) {
+      mapEntries.push(
+        new xdr.ScMapEntry({
+          key: nativeToScVal("new_title", { type: "symbol" }) as xdr.ScVal,
+          val: nativeToScVal(overrides.newTitle, { type: "string" }) as xdr.ScVal,
         }),
       );
     }
@@ -2912,8 +2934,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         const optimisticInvoice: Invoice = {
           ...sourceInvoice,
           id,
-          clonedFrom: sourceId,
-          parentInvoiceId: sourceId,
+          clonedFrom: sourceId.toString(),
+          parentInvoiceId: sourceId.toString(),
           cloneDepth,
           funded: 0n,
           payments: [],
@@ -2945,9 +2967,352 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @throws {Error} If the method fails.
    */
       if (error instanceof Error && error.message.includes("not found")) {
-        throw new InvoiceNotFoundError(sourceId);
+        throw new InvoiceNotFoundError(sourceId.toString());
       }
       throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #850 — clone lineage
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Return the full ancestor chain for an invoice, ordered root → … → invoiceId.
+   *
+   * The chain always ends with `invoiceId` itself. A non-cloned invoice returns
+   * a single-element array containing its own ID.
+   *
+   * @param invoiceId - The invoice whose lineage should be resolved.
+   * @returns Invoice IDs as `bigint[]` in root-to-leaf order.
+   * @throws {CloneChainTooDeepError} If the clone chain is cyclic or too deep.
+   */
+  async getLineage(invoiceId: string | bigint): Promise<bigint[]> {
+    const chain = await this.resolveCloneChain(invoiceId.toString());
+    return chain.map((invoice) => BigInt(invoice.id));
+  }
+
+  /**
+   * Normalise `InvoiceParamOverrides` onto the contract's `CloneOverrides`
+   * shape, applying the same field validation as `createInvoice` (issue #850).
+   *
+   * @param input - Raw overrides supplied by the caller.
+   * @param recipientCount - Number of recipients on the source invoice.
+   * @returns Validated contract-level overrides.
+   * @throws {ValidationError} If any override is malformed.
+   */
+  private _normalizeCloneOverrides(
+    input: CloneOverrides & InvoiceParamOverrides,
+    recipientCount: number,
+  ): CloneOverrides {
+    const out: CloneOverrides = { ...input };
+
+    if (input.title !== undefined) {
+      if (typeof input.title !== "string" || input.title.trim().length === 0) {
+        throw new ValidationError(
+          "cloneInvoice override `title` must be a non-empty string.",
+        );
+      }
+      out.newTitle = input.title.trim();
+    }
+
+    if (input.deadline !== undefined) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (
+        typeof input.deadline !== "number" ||
+        !Number.isFinite(input.deadline) ||
+        input.deadline <= nowSeconds
+      ) {
+        throw new ValidationError(
+          "cloneInvoice override `deadline` must be a future unix timestamp in seconds.",
+        );
+      }
+      out.newDeadline = input.deadline;
+    }
+
+    if (input.recipients !== undefined) {
+      if (
+        !Array.isArray(input.recipients) ||
+        input.recipients.length === 0 ||
+        input.recipients.some(
+          (address) =>
+            typeof address !== "string" ||
+            !/^[GC][A-Z2-7]{55}$/.test(address),
+        )
+      ) {
+        throw new ValidationError(
+          "cloneInvoice override `recipients` must be a non-empty array of valid Stellar addresses.",
+        );
+      }
+      out.newRecipients = [...input.recipients];
+    }
+
+    if (input.targetAmount !== undefined) {
+      if (typeof input.targetAmount !== "bigint" || input.targetAmount <= 0n) {
+        throw new ValidationError(
+          "cloneInvoice override `targetAmount` must be a positive bigint (stroops).",
+        );
+      }
+      const count = out.newRecipients?.length ?? recipientCount;
+      if (count <= 0) {
+        throw new ValidationError(
+          "cloneInvoice override `targetAmount` requires at least one recipient.",
+        );
+      }
+      // Split the total evenly, assigning any remainder stroops to the first
+      // recipient so the parts always sum back to `targetAmount`.
+      const base = input.targetAmount / BigInt(count);
+      const remainder = input.targetAmount - base * BigInt(count);
+      out.newAmounts = Array.from({ length: count }, (_, index) =>
+        index === 0 ? base + remainder : base,
+      );
+      if (out.newAmounts.some((amount) => amount <= 0n)) {
+        throw new ValidationError(
+          "cloneInvoice override `targetAmount` is too small to split across recipients.",
+        );
+      }
+    }
+
+    if (
+      out.newAmounts !== undefined &&
+      out.newRecipients !== undefined &&
+      out.newAmounts.length !== out.newRecipients.length
+    ) {
+      throw new ValidationError(
+        "cloneInvoice overrides must provide one amount per recipient.",
+      );
+    }
+
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #842 — real-time invoice event streaming
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Subscribe to real-time state changes for a single invoice.
+   *
+   * Polls the Soroban `getEvents` RPC (`pollIntervalMs`, default 3000ms),
+   * deduplicates events by ledger sequence + topic hash, and reconnects with
+   * exponential backoff (up to `maxRetries`, default 5) before emitting an
+   * `error` lifecycle event.
+   *
+   * @param invoiceId - The invoice ID to watch.
+   * @param callback  - Invoked once per new {@link InvoiceEvent}.
+   * @param options   - Optional poll/backoff/storage overrides.
+   * @returns A {@link Subscription} whose `unsubscribe()` stops all polling.
+   * @example
+   * const sub = client.subscribeInvoice(42n, (event) => console.log(event.type));
+   * // later
+   * sub.unsubscribe();
+   */
+  subscribeInvoice(
+    invoiceId: bigint | string,
+    callback: (event: InvoiceEvent) => void,
+    options: SubscriptionOptions = {},
+  ): Subscription {
+    return createInvoiceSubscription(
+      this.server,
+      this.config.contractId,
+      invoiceId.toString(),
+      callback,
+      options,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #844 — generic dry-run simulation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Simulate any contract method against Soroban RPC without submitting a
+   * transaction or consuming a sequence number.
+   *
+   * Accepts either a camelCase client method name (`createInvoice`, `pay`,
+   * `release`, `refund`, `approveRelease`, `cloneInvoice`) or the raw contract
+   * entry point (`create_invoice`, `pay`, `release_invoice`, `refund_invoice`,
+   * `approve_release`, `clone_invoice`).
+   *
+   * @param method - Method name or contract entry point to simulate.
+   * @param params - Parameters for the method.
+   * @returns A {@link SimulationResult}; `success` is `false` (rather than a
+   *          throw) when the contract rejects the call.
+   */
+  async simulate(
+    method: string,
+    params: Record<string, unknown> = {},
+  ): Promise<SimulationResult> {
+    const operation = this._buildSimulationOperation(method, params);
+    const source = String(
+      params.creator ??
+        params.payer ??
+        params.source ??
+        params.approver ??
+        "",
+    );
+    if (!/^G[A-Z2-7]{55}$/.test(source)) {
+      throw new ValidationError(
+        "simulate() requires a Stellar account `source` (or `creator`/`payer`) to build the dry-run transaction.",
+      );
+    }
+    const account = await this.server
+      .getAccount(source)
+      .catch(() => new Account(source, "0"));
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build();
+
+    const simResult = await this.server.simulateTransaction(tx);
+    return this._toSimulationResult(simResult);
+  }
+
+  /** Convert a raw Soroban simulation response into a {@link SimulationResult}. */
+  private _toSimulationResult(
+    sim: SorobanRpc.Api.SimulateTransactionResponse,
+  ): SimulationResult {
+    const emptyFootprint: LedgerFootprint = {
+      readBytes: 0n,
+      writeBytes: 0n,
+      readLedgerEntries: 0n,
+      writeLedgerEntries: 0n,
+    };
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      return {
+        success: false,
+        error: (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error,
+        fee: 0n,
+        cpuInsns: 0n,
+        memBytes: 0n,
+        footprint: emptyFootprint,
+      };
+    }
+
+    const success = sim as SorobanRpc.Api.SimulateTransactionSuccessResponse;
+    let footprint = emptyFootprint;
+    try {
+      const resources = success.transactionData.build().resources();
+      const ledgerFootprint = resources.footprint();
+      footprint = {
+        readBytes: BigInt(resources.readBytes()),
+        writeBytes: BigInt(resources.writeBytes()),
+        readLedgerEntries: BigInt(ledgerFootprint.readOnly().length),
+        writeLedgerEntries: BigInt(ledgerFootprint.readWrite().length),
+      };
+    } catch {
+      // Restore/error responses may omit `transactionData`; leave zeros.
+    }
+
+    const cost = (success as unknown as {
+      cost?: { cpuInsns?: string; memBytes?: string };
+    }).cost;
+
+    return {
+      success: true,
+      fee: BigInt(success.minResourceFee ?? "0"),
+      cpuInsns: BigInt(cost?.cpuInsns ?? 0),
+      memBytes: BigInt(cost?.memBytes ?? 0),
+      footprint,
+    };
+  }
+
+  /**
+   * Build the contract operation for {@link simulate} from a method name and
+   * a plain parameter object.
+   */
+  private _buildSimulationOperation(
+    method: string,
+    params: Record<string, unknown>,
+  ): xdr.Operation {
+    const aliases: Record<string, string> = {
+      createInvoice: "create_invoice",
+      pay: "pay",
+      release: "release_invoice",
+      releaseInvoice: "release_invoice",
+      releaseGroup: "release_invoice_group",
+      refund: "refund_invoice",
+      refundInvoice: "refund_invoice",
+      approveRelease: "approve_release",
+      cloneInvoice: "clone_invoice",
+    };
+    const entryPoint = aliases[method] ?? method;
+
+    switch (entryPoint) {
+      case "create_invoice": {
+        const recipients = (params.recipients ?? []) as Array<{
+          address: string;
+          amount: bigint;
+        }>;
+        if (!Array.isArray(recipients) || recipients.length === 0) {
+          throw new ValidationError(
+            "simulate(create_invoice) requires a non-empty `recipients` array.",
+          );
+        }
+        return this.contract.call(
+          "create_invoice",
+          nativeToScVal(String(params.creator), { type: "address" }),
+          xdr.ScVal.scvVec(
+            recipients.map((r) => nativeToScVal(r.address, { type: "address" })),
+          ),
+          xdr.ScVal.scvVec(
+            recipients.map((r) => nativeToScVal(r.amount, { type: "i128" })),
+          ),
+          nativeToScVal(String(params.token), { type: "address" }),
+          nativeToScVal(Number(params.deadline), { type: "u64" }),
+        );
+      }
+      case "pay":
+        return this.contract.call(
+          "pay",
+          nativeToScVal(String(params.payer), { type: "address" }),
+          nativeToScVal(BigInt(params.invoiceId as string | number | bigint), {
+            type: "u64",
+          }),
+          nativeToScVal(params.amount, { type: "i128" }),
+          nativeToScVal(Boolean(params.donateOnFailure ?? false), {
+            type: "bool",
+          }),
+        );
+      case "clone_invoice":
+        return this.contract.call(
+          "clone_invoice",
+          nativeToScVal(
+            BigInt(
+              (params.sourceId ?? params.invoiceId) as string | number | bigint,
+            ),
+            { type: "u64" },
+          ),
+          xdr.ScVal.scvMap([]),
+        );
+      case "release_invoice":
+      case "refund_invoice":
+      case "approve_release":
+        return this.contract.call(
+          entryPoint,
+          nativeToScVal(
+            BigInt((params.invoiceId ?? params.id) as string | number | bigint),
+            { type: "u64" },
+          ),
+        );
+      case "release_invoice_group":
+        return this.contract.call(
+          "release_invoice_group",
+          nativeToScVal(String(params.creator), { type: "address" }),
+          nativeToScVal(BigInt(params.groupId as string | number | bigint), {
+            type: "u64",
+          }),
+        );
+      default:
+        return this.contract.call(
+          entryPoint,
+          ...Object.values(params).map((value) => nativeToScVal(value as never)),
+        );
     }
   }
 
@@ -2960,7 +3325,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param params - The parameters for the method.
    * @throws {Error} If the method fails.
    */
-  async pay(params: PayParams): Promise<TxResult> {
+  async pay(params: PayParams & { simulate: true }): Promise<SimulationResult>;
+  async pay(params: PayParams): Promise<TxResult>;
+  async pay(params: PayParams): Promise<TxResult | SimulationResult> {
+    // Issue #844 — `{ simulate: true }` performs a dry-run instead of submitting.
+    if (params.simulate) {
+      return this.simulate(
+        "pay",
+        params as unknown as Record<string, unknown>,
+      );
+    }
     const startTime = Date.now();
     params = this._pluginRegistry.runBeforeCall("pay", params);
 
@@ -4992,7 +5366,21 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param params - The parameters for the method.
    * @throws {Error} If the method fails.
    */
-  async releaseGroup(creator: string, groupId: string): Promise<TxResult> {
+  async releaseGroup(
+    creator: string,
+    groupId: string,
+    options: { simulate: true },
+  ): Promise<SimulationResult>;
+  async releaseGroup(creator: string, groupId: string): Promise<TxResult>;
+  async releaseGroup(
+    creator: string,
+    groupId: string,
+    options?: { simulate?: boolean },
+  ): Promise<TxResult | SimulationResult> {
+    // Issue #844 — `{ simulate: true }` performs a dry-run instead of submitting.
+    if (options?.simulate) {
+      return this.simulate("release_invoice_group", { creator, groupId });
+    }
     const operation = this.contract.call(
       "release_invoice_group",
   /**
@@ -9019,8 +9407,26 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   async refundInvoice(
     invoiceId: string,
     creator: string,
+    payerAddress: string | undefined,
+    options: { simulate: true },
+  ): Promise<SimulationResult>;
+  async refundInvoice(
+    invoiceId: string,
+    creator: string,
     payerAddress?: string,
-  ): Promise<{ txHash: string; fallback: false } | ClaimableRefundResult> {
+  ): Promise<{ txHash: string; fallback: false } | ClaimableRefundResult>;
+  async refundInvoice(
+    invoiceId: string,
+    creator: string,
+    payerAddress?: string,
+    options?: { simulate?: boolean },
+  ): Promise<
+    SimulationResult | { txHash: string; fallback: false } | ClaimableRefundResult
+  > {
+    // Issue #844 — `{ simulate: true }` performs a dry-run instead of submitting.
+    if (options?.simulate) {
+      return this.simulate("refund_invoice", { invoiceId });
+    }
     const startTime = Date.now();
 
     try {

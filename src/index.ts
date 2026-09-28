@@ -604,6 +604,13 @@ export type {
   Subscription,
   SubscriptionOptions,
   SubscriptionLifecycleEvent,
+  // Issue #844 — dry-run simulation surface
+  SimulationResult,
+  LedgerFootprint,
+  SimulateMutationOptions,
+  MaybeSimulated,
+  // Issue #850 — clone field overrides
+  InvoiceParamOverrides,
   // New: AMM Calculator
   PoolSwapEstimate,
   PoolShareResult,
@@ -742,7 +749,10 @@ export { SimulationSandbox } from "./sandbox/SimulationSandbox.js";
 export type {
   SandboxClient,
   SimulationCost,
-  SimulationResult,
+  // The sandbox result type is re-exported under an unambiguous alias so it
+  // does not collide with the RPC `SimulationResult` (issue #844) exported
+  // from `./types.js` above.
+  SimulationResult as SandboxSimulationResult,
   SandboxInvoiceRecord,
   SandboxPaymentRecord,
   SandboxCallLogEntry,

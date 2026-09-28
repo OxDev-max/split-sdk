@@ -111,10 +111,91 @@ new StellarSplitClient(config: StellarSplitClientConfig)
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `createInvoice(params)` | `Promise<{ invoiceId, txHash }>` | Create a new invoice |
-| `pay(params)` | `Promise<{ txHash }>` | Pay toward an invoice |
+| `createInvoice(params)` | `Promise<{ invoiceId, txHash }>` | Create a new invoice (`{ simulate: true }` returns a `SimulationResult`) |
+| `pay(params)` | `Promise<{ txHash }>` | Pay toward an invoice (`{ simulate: true }` returns a `SimulationResult`) |
 | `getInvoice(id)` | `Promise<Invoice>` | Fetch invoice by ID |
 | `getPayments(id)` | `Promise<Payment[]>` | Fetch payments for an invoice |
+| `cloneInvoice(sourceId, overrides?)` | `Promise<string>` | Clone an invoice with optional field overrides; returns the new invoice ID |
+| `getLineage(invoiceId)` | `Promise<bigint[]>` | Ancestor chain (root → … → invoice) as bigint IDs |
+| `subscribeInvoice(invoiceId, cb, options?)` | `Subscription` | Stream invoice events with dedup + auto-reconnect |
+| `simulate(method, params)` | `Promise<SimulationResult>` | Dry-run any contract method via Soroban simulation RPC |
+
+### Dry-Run Simulation
+
+Simulate any mutating transaction against Soroban RPC to get fee and resource
+estimates without consuming a sequence number. `createInvoice`, `pay`,
+`releaseGroup` and `refundInvoice` accept a `{ simulate: true }` option; the
+generic `simulate()` method works for any contract entry point (including
+`release`, `approveRelease` and `cloneInvoice`).
+
+```typescript
+const result = await client.simulate("createInvoice", {
+  creator: publicKey,
+  recipients: [{ address: "GABC...", amount: parseAmount("100") }],
+  token: "USDC_CONTRACT_ADDRESS",
+  deadline: deadlineFromDays(7),
+});
+
+console.log(result.success, result.fee, result.cpuInsns, result.memBytes);
+console.log(result.footprint); // { readBytes, writeBytes, readLedgerEntries, writeLedgerEntries }
+
+// Or inline on a supported method:
+const simulated = await client.createInvoice({ ...params, simulate: true });
+if (simulated.success) console.log(`Estimated fee: ${simulated.fee}`);
+```
+
+### Cloning Invoices
+
+```typescript
+// Clone with optional field overrides (validated like createInvoice)
+const newId = await client.cloneInvoice(42n, {
+  title: "Rebalanced split",
+  deadline: deadlineFromDays(14),
+  targetAmount: parseAmount("250"),
+  recipients: ["GABC...", "GDEF..."],
+});
+
+// Inspect the full ancestor chain (root first)
+const lineage = await client.getLineage(newId); // [1n, 2n, 42n, newId]
+```
+
+### Real-Time Invoice Events
+
+```typescript
+const subscription = client.subscribeInvoice(42n, (event) => {
+  console.log(event.type, event.invoiceId); // payment | released | refunded | ...
+});
+
+// Later — stop polling and release timers
+subscription.unsubscribe();
+```
+
+Polling uses Soroban `getEvents` every `pollIntervalMs` (default 3000ms),
+deduplicates by ledger sequence + topic hash, and reconnects with exponential
+backoff (up to `maxRetries`, default 5) before emitting an `error` lifecycle
+event.
+
+### Resilience: Retries & Circuit Breaker
+
+All RPC calls are wrapped with exponential backoff + jitter and a circuit
+breaker that opens after N consecutive failures and auto-resets after a
+cooldown. Non-retryable errors (invalid input, unauthorized) bypass retries.
+
+```typescript
+const client = new StellarSplitClient({
+  rpcUrl: "https://soroban-testnet.stellar.org",
+  networkPassphrase: "Test SDF Network ; September 2015",
+  contractId: "YOUR_CONTRACT_ID",
+  circuitBreaker: {
+    retry: { maxRetries: 5, baseDelayMs: 250, maxDelayMs: 10_000, jitter: true },
+    breaker: { failureThreshold: 5, resetTimeoutMs: 30_000 },
+  },
+});
+
+client.on("circuit:open", () => console.warn("RPC circuit opened"));
+client.on("circuit:half-open", () => console.warn("RPC circuit probing"));
+client.on("circuit:close", () => console.info("RPC circuit closed"));
+```
 
 ### Wallet Helpers
 

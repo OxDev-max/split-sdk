@@ -487,6 +487,12 @@ export interface CreateInvoiceParams {
   /** Optional memo / description. */
   memo?: string;
   /**
+   * When `true`, simulate the transaction against Soroban RPC instead of
+   * submitting it, and resolve with a {@link SimulationResult} (issue #844).
+   * @default false
+   */
+  simulate?: boolean;
+  /**
    * When `true`, skip the `RecipientBalancePreCheck` that normally runs
    * before the invoice is submitted. Use only for advanced flows where you
    * have already validated recipients independently.
@@ -535,6 +541,12 @@ export interface PayParams {
    * fails to reach its goal. Defaults to false.
    */
   donateOnFailure?: boolean;
+  /**
+   * When `true`, simulate the payment against Soroban RPC instead of
+   * submitting it, and resolve with a {@link SimulationResult} (issue #844).
+   * @default false
+   */
+  simulate?: boolean;
 }
 
 /** @deprecated Use PayParams instead. */
@@ -787,7 +799,48 @@ export interface CloneOverrides {
    * recipient account lookups.
    */
   horizonUrl?: string;
+  /**
+   * Optional new title/memo stored on the cloned invoice.
+   * Serialised as the `new_title` entry of the clone override map (issue #850).
+   */
+  newTitle?: string;
 }
+
+/**
+ * Field-level overrides accepted by {@link StellarSplitClient.cloneInvoice}
+ * (issue #850). These are mapped onto the contract's `clone_invoice` override
+ * map after validation, mirroring the checks applied by `createInvoice`.
+ */
+export interface InvoiceParamOverrides {
+  /** Optional new title/memo for the cloned invoice (non-empty string). */
+  title?: string;
+  /** Optional new deadline as a future unix timestamp in seconds. */
+  deadline?: number;
+  /** Optional new total target amount in stroops (positive bigint). */
+  targetAmount?: bigint;
+  /** Optional replacement recipient addresses (must be valid Stellar addresses). */
+  recipients?: string[];
+}
+
+/**
+ * Options accepted by mutating methods to request a dry-run simulation
+ * against Soroban RPC instead of submitting a transaction (issue #844).
+ */
+export interface SimulateMutationOptions {
+  /**
+   * When `true`, the transaction is simulated and never submitted, and the
+   * method resolves with a {@link SimulationResult}.
+   * @default false
+   */
+  simulate?: boolean;
+}
+
+/**
+ * Result of a mutating client method that supports `{ simulate: true }`.
+ * Resolves with the real submission result, or a {@link SimulationResult}
+ * when simulation was requested.
+ */
+export type MaybeSimulated<T> = T | SimulationResult;
 
 /** Field names supported by read methods that can return partial objects. */
 export type InvoiceField = keyof Invoice;
