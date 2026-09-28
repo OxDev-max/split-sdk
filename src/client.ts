@@ -38,6 +38,18 @@ export type SplitClientEventMap = {
   "endpoint:demoted": { url: string; reason: "consecutive_errors" | "failed_health_check" };
   /** A previously quarantined RpcLoadBalancer endpoint passed its health check and rejoined rotation. */
   "endpoint:reinstated": { url: string };
+  /** Emitted when a batch of invoices is successfully created. */
+  "batch:created": { invoiceIds: bigint[] };
+  /** Emitted when a payment is made to an invoice. */
+  payment: import("./contractEvents.js").PaymentEvent;
+  /** Emitted when funds are released from an invoice. */
+  release: import("./contractEvents.js").ReleaseEvent;
+  /** Emitted when an invoice is refunded. */
+  refund: import("./contractEvents.js").RefundEvent;
+  /** Emitted when a dispute is opened on an invoice. */
+  dispute: import("./contractEvents.js").DisputeEvent;
+  /** Emitted when a tier is unlocked on an invoice. */
+  tier_unlocked: import("./contractEvents.js").TierUnlockedEvent;
 };
 import { signTransaction } from "./wallet.js";
 import { telemetry } from "./telemetry.js";
@@ -94,7 +106,13 @@ import type {
   CircuitBreakerStateSnapshot,
 } from "./resilience/CircuitBreaker.js";
 import type { WaterfallPlan } from "./types/routing.js";
-import { WaterfallInsufficientFundsError } from "./errors.js";
+import {
+  WaterfallInsufficientFundsError,
+  InvalidAttestationError,
+  AlreadyRatedError,
+  InvoiceNotReleasedForRatingError,
+  NotEligibleToVoteError,
+} from "./errors.js";
 import { OptimisticCache } from "./cache/OptimisticCache.js";
 import type { CommitFn, RollbackFn } from "./cache/OptimisticCache.js";
 import { getOptimisticInvoice } from "./optimistic.js";
@@ -157,6 +175,10 @@ import type {
   BridgePaymentParams,
   BridgePaymentRequest,
   SignedBridgeProof,
+  Attestation,
+  CreatorRating,
+  ExtensionStatus,
+  GroupStats,
 } from "./types.js";
 import {
   estimateBridgeFee as _estimateBridgeFee,
@@ -202,6 +224,7 @@ import {
   StellarSplitError,
   AdminOperationError,
   PassphraseMismatchError,
+  NetworkMismatchError,
   InvoiceIntegrityError,
   InvoiceNotCloneableError,
   InvalidTransactionTypeError,
@@ -278,6 +301,13 @@ import type {
   CircuitBreakerConfig,
 } from "./resilientRpc.js";
 import { NetworkPassphraseValidator } from "./network/NetworkPassphraseValidator.js";
+import {
+  NetworkEnvironment,
+  getNetworkPreset,
+  isNetworkPreset,
+  detectNetworkEnvironment,
+} from "./config.js";
+import type { NetworkPreset } from "./config.js";
 import type { OtelHandle, TelemetryOptions } from "./telemetry/OtelExporter.js";
 import { createOtelHandle, noopOtelHandle, OtelExporter } from "./telemetry/OtelExporter.js";
 
@@ -688,6 +718,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   private _requestSeq = 0;
   private readonly _inFlightRequests = new Map<string, InFlightRequestInfo>();
   private readonly _inFlightRequestPromises = new Map<string, Promise<unknown>>();
+  /** Network the client is currently bound to (see `switchNetwork`). */
+  private _activeEnvironment: NetworkEnvironment =
+    NetworkEnvironment.CUSTOM;
+  /** Resolved preset for the active network, when known. */
+  private _activePreset: NetworkPreset | null = null;
   private readonly _managedHorizonStreams = new Set<{ stop(): void }>();
   private readonly _stateMachine: InvoiceStateMachine;
   /**
@@ -839,6 +874,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    */
     validateOrThrow(config);
     this.config = config;
+    this._activeEnvironment = detectNetworkEnvironment(config.networkPassphrase);
     this._metadataValidator = new InvoiceMetadataValidator(
       config.metadataSchema,
       config.metadataThrowOnInvalid ?? true,
@@ -1187,6 +1223,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         });
       this._instrumentOtel();
     }
+
+    this._pluginRegistry.setClientContext({
+      on: (event, handler) => this.on(event as keyof SplitClientEventMap, handler as never),
+      off: (event, handler) => this.off(event as keyof SplitClientEventMap, handler as never),
+    });
   }
 
   /**
@@ -2061,13 +2102,19 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     plugin.install?.(this);
   }
 
-  /** Register a middleware plugin (interceptor-style).
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+  /**
+   * Register a plugin with fluent API support.
+   * Plugins can extend the client with custom methods, intercept RPC calls,
+   * and subscribe to events.
+   *
+   * @param plugin - The plugin to install.
+   * @param options - Optional plugin configuration.
+   * @returns The client instance for method chaining.
+   * @throws {PluginAlreadyRegisteredError} if a plugin with the same name exists.
    */
-  use(plugin: SdkPlugin): void {
-    this._pluginRegistry.use(plugin);
+  use(plugin: SdkPlugin, options?: Record<string, unknown>): this {
+    this._pluginRegistry.use(plugin, options);
+    return this;
   }
 
   /** Deregister a middleware plugin by name.
@@ -5357,6 +5404,248 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
+   * Attest an invoice with a statement.
+   * @param invoiceId - Invoice ID to attest
+   * @param statement - Attestation statement (max 256 chars)
+   * @param payer - Payer address
+   * @returns Transaction hash
+   * @throws {InvalidAttestationError} if statement exceeds 256 chars
+   * @throws {Error} If the method fails.
+   */
+  async attestInvoice(
+    invoiceId: string,
+    statement: string,
+    payer: string
+  ): Promise<TxResult> {
+    if (statement.length > 256) {
+      throw new InvalidAttestationError("Statement must not exceed 256 characters");
+    }
+
+    const operation = this.contract.call(
+      "attest_invoice",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(statement, { type: "string" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Revoke an attestation on an invoice.
+   * @param invoiceId - Invoice ID
+   * @param payer - Payer address
+   * @returns Transaction hash
+   * @throws {Error} If the method fails.
+   */
+  async revokeAttestation(invoiceId: string, payer: string): Promise<TxResult> {
+    const operation = this.contract.call(
+      "revoke_attestation",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get all attestations for an invoice.
+   * @param invoiceId - Invoice ID
+   * @returns Array of attestations
+   * @throws {Error} If the method fails.
+   */
+  async getAttestations(invoiceId: string): Promise<Attestation[]> {
+    const operation = this.contract.call(
+      "get_attestations",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Array<Record<string, unknown>>;
+    return raw.map((a) => ({
+      attester: a.attester as string,
+      statement: a.statement as string,
+      timestamp: BigInt(a.timestamp as string | number),
+      revoked: Boolean(a.revoked),
+    }));
+  }
+
+  /**
+   * Create a campaign group.
+   * @param creator - Creator address
+   * @param name - Group name
+   * @param description - Group description
+   * @returns Group ID and transaction hash
+   * @throws {Error} If the method fails.
+   */
+  async createGroup(
+    creator: string,
+    name: string,
+    description: string
+  ): Promise<{ groupId: string; txHash: string }> {
+    const operation = this.contract.call(
+      "create_group",
+      nativeToScVal(creator, { type: "address" }),
+      nativeToScVal(name, { type: "string" }),
+      nativeToScVal(description, { type: "string" })
+    );
+
+    const result = await this._submitTx(creator, operation);
+    const groupId = scValToNative(result.returnValue).toString();
+    return { groupId, txHash: result.txHash };
+  }
+
+  /**
+   * Add an invoice to a group.
+   * @param creator - Creator address
+   * @param groupId - Group ID
+   * @param invoiceId - Invoice ID to add
+   * @returns Transaction hash
+   * @throws {Error} If caller is not the group owner or other errors.
+   */
+  async addInvoiceToGroup(
+    creator: string,
+    groupId: string,
+    invoiceId: string
+  ): Promise<TxResult> {
+    const operation = this.contract.call(
+      "add_invoice_to_group",
+      nativeToScVal(creator, { type: "address" }),
+      nativeToScVal(BigInt(groupId), { type: "u64" }),
+      nativeToScVal(BigInt(invoiceId), { type: "u64" })
+    );
+
+    const result = await this._submitTx(creator, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get statistics for a group.
+   * @param groupId - Group ID
+   * @returns Group statistics
+   * @throws {Error} If the method fails.
+   */
+  async getGroupStats(groupId: string): Promise<GroupStats> {
+    const operation = this.contract.call(
+      "get_group_stats",
+      nativeToScVal(BigInt(groupId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+    return {
+      name: raw.name as string,
+      totalTarget: BigInt(raw.totalTarget as string | number),
+      totalFunded: BigInt(raw.totalFunded as string | number),
+      invoiceCount: BigInt(raw.invoiceCount as string | number),
+      fullyFundedCount: BigInt(raw.fullyFundedCount as string | number),
+    };
+  }
+
+  /**
+   * Get invoices in a group.
+   * @param groupId - Group ID
+   * @returns Array of invoice IDs in the group
+   * @throws {Error} If the method fails.
+   */
+  async getGroupInvoices(groupId: string): Promise<bigint[]> {
+    const operation = this.contract.call(
+      "get_group_invoices",
+      nativeToScVal(BigInt(groupId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as (string | number)[];
+    return raw.map((id) => BigInt(id));
+  }
+
+  /**
+   * Vote to extend a deadline.
+   * @param invoiceId - Invoice ID
+   * @param payer - Payer address (must be a contributor)
+   * @returns Transaction hash
+   * @throws {NotEligibleToVoteError} if caller has not contributed
+   * @throws {Error} If the method fails.
+   */
+  async voteExtendDeadline(invoiceId: string, payer: string): Promise<TxResult> {
+    const operation = this.contract.call(
+      "vote_extend_deadline",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get deadline extension status for an invoice.
+   * @param invoiceId - Invoice ID
+   * @returns Extension status
+   * @throws {Error} If the method fails.
+   */
+  async getExtensionStatus(invoiceId: string): Promise<ExtensionStatus> {
+    const operation = this.contract.call(
+      "get_extension_status",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+    return {
+      voteCount: BigInt(raw.voteCount as string | number),
+      quorumRequired: BigInt(raw.quorumRequired as string | number),
+      extensionCount: BigInt(raw.extensionCount as string | number),
+      maxExtensions: BigInt(raw.maxExtensions as string | number),
+      currentDeadline: BigInt(raw.currentDeadline as string | number),
+    };
+  }
+
+  /**
+   * Rate an invoice.
+   * @param invoiceId - Invoice ID to rate
+   * @param stars - Star rating (1-5)
+   * @param payer - Payer address
+   * @returns Transaction hash
+   * @throws {InvoiceNotReleasedForRatingError} if invoice is not released
+   * @throws {AlreadyRatedError} if caller has already rated
+   * @throws {Error} If the method fails.
+   */
+  async rateInvoice(invoiceId: string, stars: 1 | 2 | 3 | 4 | 5, payer: string): Promise<TxResult> {
+    const operation = this.contract.call(
+      "rate_invoice",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(BigInt(stars), { type: "u32" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get the creator's rating information.
+   * @param creator - Creator address
+   * @returns Creator rating with total ratings and average stars
+   * @throws {Error} If the method fails.
+   */
+  async getCreatorRating(creator: string): Promise<CreatorRating> {
+    const operation = this.contract.call(
+      "get_creator_rating",
+      nativeToScVal(creator, { type: "address" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+    const totalRatings = BigInt(raw.totalRatings as string | number);
+    const totalStars = BigInt(raw.totalStars as string | number);
+    const averageStars =
+      totalRatings > 0n ? Number(totalStars) / Number(totalRatings) : 0;
+
+    return {
+      totalRatings,
+      averageStars,
+    };
+  }
+
+  /**
    * Calculate the protocol fee for a given amount.
    *
    * @param amount - Gross amount in stroops
@@ -6448,78 +6737,228 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Switch to a different network.
+   * Switches the client to a different Stellar network at runtime.
    *
-   * @param network - Network name ('testnet', 'mainnet') or custom NetworkConfig
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * The Soroban RPC endpoint of the requested network is contacted and the
+   * passphrase it reports is compared against the preset **before** the switch
+   * is accepted. When they disagree a {@link NetworkMismatchError} is thrown
+   * and the client keeps its current configuration.
+   *
+   * Requests that are already in flight when this method is called are awaited
+   * to completion so they finish against the original network; requests issued
+   * after the returned promise resolves observe the new configuration.
+   *
+   * Passing {@link NetworkEnvironment.CUSTOM} requires a full
+   * {@link NetworkPreset} — omitting it is rejected at compile time by the
+   * overload signatures and throws at runtime for untyped callers.
+   *
+   * @example
+   * ```ts
+   * await client.switchNetwork(NetworkEnvironment.TESTNET);
+   * await client.switchNetwork(NetworkEnvironment.CUSTOM, {
+   *   horizonUrl: "https://horizon.example.org",
+   *   rpcUrl: "https://rpc.example.org",
+   *   networkPassphrase: "Example Network ; 2026",
+   * });
+   * ```
    */
-  switchNetwork(network: string | NetworkConfig): void {
-    let config: NetworkConfig;
+  switchNetwork(
+    environment:
+      | NetworkEnvironment.MAINNET
+      | NetworkEnvironment.TESTNET
+      | NetworkEnvironment.FUTURENET,
+  ): Promise<void>;
+  switchNetwork(
+    environment: NetworkEnvironment.CUSTOM,
+    preset: NetworkPreset,
+  ): Promise<void>;
+  switchNetwork(preset: NetworkPreset): Promise<void>;
+  /**
+   * @deprecated Pass a {@link NetworkEnvironment} member or a
+   * {@link NetworkPreset} instead. The legacy `"testnet" | "mainnet"` string
+   * and {@link NetworkConfig} forms are still accepted for backwards
+   * compatibility.
+   */
+  switchNetwork(
+    network: "mainnet" | "testnet" | "futurenet" | NetworkConfig,
+  ): Promise<void>;
+  async switchNetwork(
+    environmentOrPreset:
+      | NetworkEnvironment
+      | NetworkPreset
+      | "mainnet"
+      | "testnet"
+      | "futurenet"
+      | NetworkConfig,
+    customPreset?: NetworkPreset,
+  ): Promise<void> {
+    const target = this._resolveNetworkTarget(environmentOrPreset, customPreset);
 
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-    if (typeof network === "string") {
-      const preset = NETWORKS[network];
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-      if (!preset) {
-        throw new UnknownNetworkError(network);
-      }
-      config = { ...preset, contractId: this.config.contractId };
-    } else {
-      config = network;
+    // Fail fast: cross-check the preset against the live RPC node before we
+    // touch any client state. `NetworkPassphraseValidator.validate` fails open
+    // when the node is unreachable, matching startup validation.
+    const validation = await NetworkPassphraseValidator.validate(
+      target.preset.networkPassphrase,
+      target.preset.rpcUrl,
+    );
+    if (validation.mismatch) {
+      throw new NetworkMismatchError(validation.configured, validation.reported);
     }
 
-    this.config = config;
-    this.server = new SorobanRpc.Server(config.rpcUrl, {
-      allowHttp: config.rpcUrl.startsWith("http://"),
+    // Let already-issued requests settle against the original network.
+    await this.waitForInFlightRequests();
+
+    // Everything below is synchronous, so no request can observe a
+    // half-applied endpoint.
+    this.config = {
+      ...this.config,
+      rpcUrl: target.preset.rpcUrl,
+      networkPassphrase: target.preset.networkPassphrase,
+      horizonUrl: target.preset.horizonUrl,
+      ...(target.contractId ? { contractId: target.contractId } : {}),
+    };
+    this._activeEnvironment = target.environment;
+    this._activePreset = target.preset;
+
+    this._rebindNetworkEndpoint(target.preset);
+  }
+
+  /** The {@link NetworkEnvironment} the client is currently bound to. */
+  get activeNetwork(): NetworkEnvironment {
+    return this._activeEnvironment;
+  }
+
+  /** The resolved {@link NetworkPreset} backing the active network. */
+  get activeNetworkPreset(): NetworkPreset {
+    return (
+      this._activePreset ?? {
+        horizonUrl: this.config.horizonUrl ?? "",
+        rpcUrl: Array.isArray(this.config.rpcUrl)
+          ? this.config.rpcUrl[0]!
+          : this.config.rpcUrl,
+        networkPassphrase: this.config.networkPassphrase,
+      }
+    );
+  }
+
+  /** Normalises every accepted `switchNetwork` argument shape. */
+  private _resolveNetworkTarget(
+    environmentOrPreset:
+      | NetworkEnvironment
+      | NetworkPreset
+      | "mainnet"
+      | "testnet"
+      | "futurenet"
+      | NetworkConfig,
+    customPreset?: NetworkPreset,
+  ): {
+    preset: NetworkPreset;
+    environment: NetworkEnvironment;
+    contractId?: string;
+  } {
+    if (isNetworkPreset(environmentOrPreset)) {
+      return {
+        preset: environmentOrPreset,
+        environment: NetworkEnvironment.CUSTOM,
+      };
+    }
+
+    if (typeof environmentOrPreset === "object" && environmentOrPreset !== null) {
+      // Legacy NetworkConfig shape (carries `contractId`, no `horizonUrl`).
+      const legacy = environmentOrPreset as NetworkConfig;
+      return {
+        preset: {
+          horizonUrl: this.config.horizonUrl ?? "",
+          rpcUrl: legacy.rpcUrl,
+          networkPassphrase: legacy.networkPassphrase,
+        },
+        environment: NetworkEnvironment.CUSTOM,
+        contractId: legacy.contractId,
+      };
+    }
+
+    if (environmentOrPreset === NetworkEnvironment.CUSTOM) {
+      if (!customPreset || !isNetworkPreset(customPreset)) {
+        throw new ValidationError(
+          "NetworkEnvironment.CUSTOM requires a full NetworkPreset " +
+            "({ horizonUrl, rpcUrl, networkPassphrase }).",
+        );
+      }
+      return { preset: customPreset, environment: NetworkEnvironment.CUSTOM };
+    }
+
+    const environment = environmentOrPreset as Exclude<
+      NetworkEnvironment,
+      NetworkEnvironment.CUSTOM
+    >;
+    return {
+      preset: getNetworkPreset(environment),
+      environment: environment as NetworkEnvironment,
+    };
+  }
+
+  /** Rebinds every endpoint-bound subsystem to a new network preset. */
+  private _rebindNetworkEndpoint(preset: NetworkPreset): void {
+    // A warm-standby list or a load balancer belongs to the previous network.
+    this._standby?.stop();
+    this._standby = null;
+    if (this._rpcLoadBalancer) {
+      this._rpcLoadBalancer.stop();
+      this._rpcLoadBalancer = null;
+    }
+
+    this.server = new SorobanRpc.Server(preset.rpcUrl, {
+      allowHttp: preset.rpcUrl.startsWith("http://"),
     });
 
-    // Rebuild the connection pool for the new endpoint. We read from
-    // `_effectiveRpcPoolSize` (cached at construction) rather than
-    // `this.config.rpcPoolSize` here because `NetworkConfig` doesn't carry a
-    // pool size — reading from `this.config` after `this.config = config`
-    // above would silently disable pooling on every network switch.
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-    if (this._pool) {
-      this._pool.dispose();
-      this._pool = null;
+    // `server`'s getter prefers a resilient wrapper, so rebuild it when the
+    // client was constructed with a circuit breaker.
+    if (this.config.circuitBreaker) {
+      const rpcTarget =
+        this._injectedRpcClient ?? this._rpcClient ?? this._mainServer;
+      this._resilientRpc = new ResilientRpcClient(
+        rpcTarget,
+        this.config.circuitBreaker.retry,
+        this.config.circuitBreaker.breaker,
+      );
+      this._resilientRpc.on("circuit:open", () =>
+        this.emit("circuit:open", undefined),
+      );
+      this._resilientRpc.on("circuit:close", () =>
+        this.emit("circuit:close", undefined),
+      );
+      this._resilientRpc.on("circuit:half-open", () =>
+        this.emit("circuit:half-open", undefined),
+      );
+    } else {
+      this._resilientRpc = null;
     }
-    const wantsPool = !this._standby && this._effectiveRpcPoolSize >= 2;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-    if (wantsPool) {
+
+    // Rebuild the connection pool for the new endpoint, reading the cached
+    // pool size because `_effectiveRpcPoolSize` survives config swaps.
+    this._pool?.dispose();
+    this._pool = null;
+    if (this._effectiveRpcPoolSize >= 2) {
       try {
         this._pool = new ConnectionPool({
-          rpcUrl: config.rpcUrl,
+          rpcUrl: preset.rpcUrl,
           poolSize: this._effectiveRpcPoolSize,
-          allowHttp: config.rpcUrl.startsWith("http://"),
+          allowHttp: preset.rpcUrl.startsWith("http://"),
         });
       } catch {
-        // The Soroban SDK can reject bare http:// without allowHttp or ws:// URLs.
-        // Fail open so switchNetwork() stays a no-op rather than crashing the SDK.
+        // The Soroban SDK rejects some URL shapes; fall back to a single
+        // connection rather than failing the whole switch.
       }
     }
 
-    this.contract = new Contract(config.contractId);
+    // Rebind the Horizon fallback reader and the feature detector, both of
+    // which captured the previous URL at construction time.
+    this._horizonReader = preset.horizonUrl
+      ? new HorizonFallbackReader(preset.horizonUrl)
+      : null;
+    this._sorobanFeatureDetector = new SorobanFeatureDetector({
+      rpcUrl: preset.rpcUrl,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -8007,6 +8446,306 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   // ---------------------------------------------------------------------------
+  // Issue #866 — Pause/Resume invoice
+  // ---------------------------------------------------------------------------
+
+  async pauseInvoice(
+    invoiceId: string,
+    options?: { autoResumeAt?: Date },
+  ): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const autoResumeTimestamp = options?.autoResumeAt
+        ? Math.floor(options.autoResumeAt.getTime() / 1000)
+        : 0;
+
+      const operation = this.contract.call(
+        "pause_invoice",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(autoResumeTimestamp, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("pauseInvoice", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("pauseInvoice", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async resumeInvoice(invoiceId: string): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "resume_invoice",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("resumeInvoice", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("resumeInvoice", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async isPaused(invoiceId: string): Promise<PauseStatus> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "is_paused",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+      const paused = Boolean(raw.paused);
+      const autoResumeTimestamp = Number(raw.autoResumeAt ?? raw.auto_resume_at ?? 0);
+
+      telemetry.recordMethod("isPaused", true, Date.now() - startTime);
+      return {
+        paused,
+        autoResumeAt: autoResumeTimestamp > 0 ? new Date(autoResumeTimestamp * 1000) : undefined,
+      };
+    } catch (error) {
+      telemetry.recordMethod("isPaused", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #867 — Pledge matching
+  // ---------------------------------------------------------------------------
+
+  async pledgeMatch(invoiceId: string, amount: bigint): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "pledge_match",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(amount, { type: "i128" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("pledgeMatch", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("pledgeMatch", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async claimUnmatchedPledge(invoiceId: string): Promise<bigint> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "claim_unmatched_pledge",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const amount = scValToNative(result.returnValue) as bigint;
+      telemetry.recordMethod("claimUnmatchedPledge", true, Date.now() - startTime);
+      return amount;
+    } catch (error) {
+      telemetry.recordMethod("claimUnmatchedPledge", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async getMatchPool(invoiceId: string): Promise<MatchPledge[]> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "get_match_pool",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as Array<Record<string, unknown>>;
+      const pledges: MatchPledge[] = (raw || []).map((p) => ({
+        matcher: p.matcher as string,
+        pledgedAmount: toBigInt(p.pledgedAmount ?? p.pledged_amount),
+        matchedAmount: toBigInt(p.matchedAmount ?? p.matched_amount),
+        unmatched: toBigInt(p.unmatched),
+      }));
+
+      telemetry.recordMethod("getMatchPool", true, Date.now() - startTime);
+      return pledges;
+    } catch (error) {
+      telemetry.recordMethod("getMatchPool", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #868 — Streaming payments
+  // ---------------------------------------------------------------------------
+
+  async startStream(invoiceId: string, amountPerLedger: bigint): Promise<string> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "start_stream",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(amountPerLedger, { type: "i128" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const streamId = scValToNative(result.returnValue).toString();
+      telemetry.recordMethod("startStream", true, Date.now() - startTime);
+      return streamId;
+    } catch (error) {
+      telemetry.recordMethod("startStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async settleStream(streamId: string): Promise<bigint> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "settle_stream",
+        nativeToScVal(streamId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const amount = scValToNative(result.returnValue) as bigint;
+      telemetry.recordMethod("settleStream", true, Date.now() - startTime);
+      return amount;
+    } catch (error) {
+      telemetry.recordMethod("settleStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async cancelStream(streamId: string): Promise<bigint> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "cancel_stream",
+        nativeToScVal(streamId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const amount = scValToNative(result.returnValue) as bigint;
+      telemetry.recordMethod("cancelStream", true, Date.now() - startTime);
+      return amount;
+    } catch (error) {
+      telemetry.recordMethod("cancelStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async getStream(streamId: string): Promise<Stream> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "get_stream",
+        nativeToScVal(streamId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+      const stream: Stream = {
+        id: streamId,
+        invoiceId: raw.invoiceId as string,
+        payer: raw.payer as string,
+        amountPerLedger: toBigInt(raw.amountPerLedger ?? raw.amount_per_ledger),
+        startLedger: Number(raw.startLedger ?? raw.start_ledger),
+        status: (raw.status as string).toLowerCase() as "active" | "settled" | "cancelled",
+      };
+
+      telemetry.recordMethod("getStream", true, Date.now() - startTime);
+      return stream;
+    } catch (error) {
+      telemetry.recordMethod("getStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  computeAccruedAmount(stream: Stream, currentLedger: number): bigint {
+    if (stream.status !== "active") return 0n;
+    const ledgersPassed = Math.max(0, currentLedger - stream.startLedger);
+    return stream.amountPerLedger * BigInt(ledgersPassed);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #869 — Delegate management
+  // ---------------------------------------------------------------------------
+
+  async addDelegate(invoiceId: string, delegate: string): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "add_delegate",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(delegate, { type: "address" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("addDelegate", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("addDelegate", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async removeDelegate(invoiceId: string, delegate: string): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "remove_delegate",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(delegate, { type: "address" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("removeDelegate", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("removeDelegate", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async isDelegate(invoiceId: string, address: string): Promise<boolean> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "is_delegate",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(address, { type: "address" }),
+      );
+
+      const result = await this._simulateView(operation);
+      const isDelegate = Boolean(result);
+      telemetry.recordMethod("isDelegate", true, Date.now() - startTime);
+      return isDelegate;
+    } catch (error) {
+      telemetry.recordMethod("isDelegate", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async getDelegates(invoiceId: string): Promise<string[]> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "get_delegates",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as string[];
+      telemetry.recordMethod("getDelegates", true, Date.now() - startTime);
+      return raw || [];
+    } catch (error) {
+      telemetry.recordMethod("getDelegates", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------------
 
@@ -9186,6 +9925,67 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     return cap > used ? cap - used : 0n;
   }
 
+  /**
+   * Get aggregate performance metrics for a creator.
+   * Combines on-chain stats and event history with 60-second caching.
+   *
+   * @param creator - Creator address.
+   * @returns Creator statistics including success rate, funding time, ratings.
+   */
+  async getCreatorStats(creator: string): Promise<import("./creatorStats.js").CreatorStats> {
+    const {
+      getCreatorStatsCache,
+      setCreatorStatsCache,
+    } = await import("./creatorStats.js");
+
+    const cached = getCreatorStatsCache(creator);
+    if (cached) return cached;
+
+    const result = await this.getInvoicesByCreator(creator);
+    const invoices = result.invoices || [];
+
+    const totalRaised = invoices.reduce((sum, inv) => sum + inv.amount, 0n);
+    const totalReleased = invoices.reduce((sum, inv) => {
+      if (inv.status === "Released") return sum + inv.amount;
+      return sum;
+    }, 0n);
+    const totalRefunded = invoices.reduce((sum, inv) => {
+      if (inv.status === "Refunded") return sum + inv.amount;
+      return sum;
+    }, 0n);
+
+    const successCount = invoices.filter((inv) => inv.status === "Released").length;
+    const successRate = invoices.length > 0 ? (successCount / invoices.length) * 100 : 0;
+
+    const fundingTimes = invoices
+      .filter((inv) => inv.paid_at && inv.created_at)
+      .map((inv) => (inv.paid_at! - inv.created_at!) / (1000 * 60 * 60));
+
+    const averageFundingTimeHours = fundingTimes.length > 0
+      ? fundingTimes.reduce((a, b) => a + b, 0) / fundingTimes.length
+      : 0;
+
+    const uniquePayers = new Set(
+      invoices
+        .filter((inv) => inv.payments && inv.payments.length > 0)
+        .flatMap((inv) => inv.payments!.map((p) => p.payer)),
+    ).size;
+
+    const stats = {
+      totalInvoices: invoices.length,
+      totalRaised,
+      totalReleased,
+      totalRefunded,
+      successRate: Math.round(successRate * 100) / 100,
+      averageFundingTimeHours: Math.round(averageFundingTimeHours * 100) / 100,
+      uniquePayerCount: uniquePayers,
+      averageRating: 0,
+    };
+
+    setCreatorStatsCache(creator, stats);
+    return stats;
+  }
+
   // ---------------------------------------------------------------------------
   // Issue #277 — Batch invoice creation helper
   // ---------------------------------------------------------------------------
@@ -9438,6 +10238,58 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         false,
         Date.now() - startTime,
       );
+      throw error;
+    }
+  }
+
+  /**
+   * Create multiple invoices in one transaction with full validation before submission.
+   * All invoices are validated client-side before any RPC call is made.
+   *
+   * @param invoices - Array of invoice parameters (1-20 items).
+   * @returns Array of created invoice IDs in the same order as input.
+   * @throws {BatchTooLargeError} if more than 20 invoices.
+   * @throws {ValidationError} if any invoice fails validation.
+   */
+  async batchCreateInvoices(
+    invoices: CreateInvoiceParams[],
+  ): Promise<bigint[]> {
+    const { BatchTooLargeError } = await import("./errors.js");
+
+    if (invoices.length < 1 || invoices.length > 20) {
+      throw new BatchTooLargeError(invoices.length, 20);
+    }
+
+    for (let i = 0; i < invoices.length; i++) {
+      const invoice = invoices[i]!;
+      if (!invoice.creator) {
+        throw new ValidationError(`Invoice ${i}: creator is required`);
+      }
+      if (!invoice.token) {
+        throw new ValidationError(`Invoice ${i}: token is required`);
+      }
+      if (!invoice.deadline || invoice.deadline <= 0) {
+        throw new ValidationError(
+          `Invoice ${i}: deadline must be a positive number`,
+        );
+      }
+      this._metadataValidator.validate(invoice.metadata);
+    }
+
+    const startTime = Date.now();
+    const invoiceIds: bigint[] = [];
+
+    try {
+      for (const params of invoices) {
+        const result = await this.createInvoice(params);
+        invoiceIds.push(BigInt(result.invoiceId));
+      }
+
+      this.emit("batch:created", { invoiceIds });
+
+      return invoiceIds;
+    } catch (error) {
+      telemetry.recordMethod("batchCreateInvoices", false, Date.now() - startTime);
       throw error;
     }
   }
