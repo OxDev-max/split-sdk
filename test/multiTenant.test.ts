@@ -439,3 +439,51 @@ describe("MultiTenantClient — pool.stats()", () => {
     expect(defaultFactory).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// #846 — options-only construction
+// ---------------------------------------------------------------------------
+
+describe("MultiTenantClient — options-only construction", () => {
+  it("accepts PoolOptions as the only constructor argument", () => {
+    const pool = new MultiTenantClient({ maxClients: 2, ttlMs: 30_000 });
+
+    const first = pool.getClient("tenant-a", makeFactory()("tenant-a"));
+    const second = pool.getClient("tenant-a", makeFactory()("tenant-a"));
+
+    expect(first).toBeInstanceOf(StellarSplitClient);
+    expect(second).toBe(first);
+    expect(pool.stats()).toMatchObject({ size: 1, hits: 1, misses: 1 });
+  });
+
+  it("enforces maxClients when the pool has no factory", () => {
+    const pool = new MultiTenantClient({ maxClients: 2 });
+    const configFor = (tenantId: string): StellarSplitClientConfig => ({
+      rpcUrl: `https://${tenantId}.example.com`,
+      networkPassphrase: "Test Network",
+      contractId: makeContractId(),
+    });
+
+    pool.getClient("tenant-a", configFor("tenant-a"));
+    pool.getClient("tenant-b", configFor("tenant-b"));
+    pool.getClient("tenant-c", configFor("tenant-c"));
+
+    expect(pool.stats()).toMatchObject({ size: 2, evictions: 1 });
+  });
+
+  it("keeps honouring a client factory when one is supplied", () => {
+    const factory = makeFactory();
+    const pool = new MultiTenantClient(factory, { maxClients: 5 });
+
+    pool.getClient("tenant-a");
+
+    expect(factory).toHaveBeenCalledWith("tenant-a");
+  });
+
+  it("throws a ValidationError when neither a factory nor a config is available", () => {
+    const pool = new MultiTenantClient({ maxClients: 1 });
+
+    expect(() => pool.getClient("tenant-a")).toThrow(/No configuration available for tenant "tenant-a"/);
+  });
+});
+

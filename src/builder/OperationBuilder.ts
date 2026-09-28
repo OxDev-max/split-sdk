@@ -82,6 +82,46 @@ export interface OperationBuilderConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle events
+// ---------------------------------------------------------------------------
+
+/**
+ * Lifecycle event names emitted by {@link OperationBuilder}.
+ *
+ * - `build:start`  — emitted before envelope validation/assembly begins.
+ * - `build:complete` — emitted after a Transaction is successfully built.
+ * - `op:add`       — emitted whenever an operation is appended to the envelope.
+ * - `dryrun:complete` — emitted after a dry-run simulation resolves.
+ * - `submit:complete` — emitted after a submission resolves.
+ */
+export type OperationBuilderEvent =
+  | "build:start"
+  | "build:complete"
+  | "op:add"
+  | "dryrun:complete"
+  | "submit:complete";
+
+/** Payload passed to every {@link OperationBuilder} event listener. */
+export interface OperationBuilderEventPayload {
+  /** The event that fired. */
+  type: OperationBuilderEvent;
+  /** Number of operations currently staged in the envelope. */
+  operationCount: number;
+  /** The operation that was just added, when `type === "op:add"`. */
+  operation?: xdr.Operation;
+  /** The built transaction, when `type === "build:complete"`. */
+  transaction?: Transaction;
+  /** The dry-run result, when `type === "dryrun:complete"`. */
+  dryRunResult?: DryRunResult;
+  /** The submission result, when `type === "submit:complete"`. */
+  submitResult?: { txHash: string };
+}
+
+export type OperationBuilderListener = (
+  payload: OperationBuilderEventPayload,
+) => void;
+
+// ---------------------------------------------------------------------------
 // OperationBuilder
 // ---------------------------------------------------------------------------
 
@@ -102,12 +142,77 @@ export class OperationBuilder {
   private readonly server: SorobanRpc.Server;
   private readonly ops: xdr.Operation[] = [];
   private timebounds: TimeboundsOptions | null = null;
+  private readonly listeners = new Map<
+    OperationBuilderEvent,
+    Set<OperationBuilderListener>
+  >();
+
+  // Multi-signature state
+  private readonly signers = new Map<string, number>();
+  private thresholds: Required<SetThresholdsOptions> = {
+    masterWeight: 1,
+    low: 0,
+    medium: 0,
+    high: 0,
+  };
+  private readonly listeners = new Set<MultiSigEventListener>();
 
   constructor(config: OperationBuilderConfig) {
     this.config = config;
     this.server = new SorobanRpc.Server(config.rpcUrl, {
       allowHttp: config.rpcUrl.startsWith("http://"),
     });
+  }
+
+  // --------------------------------------------------------------------------
+  // Event handling
+  // --------------------------------------------------------------------------
+
+  /**
+   * Registers a listener for a lifecycle event.
+   *
+   * @returns an unsubscribe function that removes the listener.
+   */
+  on(
+    event: OperationBuilderEvent,
+    listener: OperationBuilderListener,
+  ): () => void {
+    let set = this.listeners.get(event);
+    if (!set) {
+      set = new Set();
+      this.listeners.set(event, set);
+    }
+    set.add(listener);
+    return () => {
+      set?.delete(listener);
+    };
+  }
+
+  /**
+   * Removes a previously registered listener.
+   */
+  off(event: OperationBuilderEvent, listener: OperationBuilderListener): this {
+    this.listeners.get(event)?.delete(listener);
+    return this;
+  }
+
+  /**
+   * Emits a lifecycle event to all registered listeners.
+   */
+  private emit(
+    type: OperationBuilderEvent,
+    extra: Omit<OperationBuilderEventPayload, "type" | "operationCount"> = {},
+  ): void {
+    const payload: OperationBuilderEventPayload = {
+      type,
+      operationCount: this.ops.length,
+      ...extra,
+    };
+    const set = this.listeners.get(type);
+    if (!set) return;
+    for (const listener of set) {
+      listener(payload);
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -125,6 +230,7 @@ export class OperationBuilder {
       source: opts.source,
     });
     this.ops.push(op);
+    this.emit("op:add", { operation: op });
     return this;
   }
 
@@ -133,6 +239,7 @@ export class OperationBuilder {
    */
   addInvokeHostFn(opts: InvokeHostFnOptions): this {
     this.ops.push(opts.operation);
+    this.emit("op:add", { operation: opts.operation });
     return this;
   }
 
@@ -145,6 +252,7 @@ export class OperationBuilder {
       source: opts.source,
     });
     this.ops.push(op);
+    this.emit("op:add", { operation: op });
     return this;
   }
 
@@ -157,6 +265,79 @@ export class OperationBuilder {
   }
 
   // --------------------------------------------------------------------------
+  // Multi-signature builder
+  // --------------------------------------------------------------------------
+
+  /**
+   * Registers a signer with an optional weight. Re-adding an existing key
+   * updates its weight. Emits a `signerAdded` event.
+   */
+  addSigner(opts: AddSignerOptions): this {
+    const weight = opts.weight ?? 1;
+    this.signers.set(opts.key, weight);
+    this._emit({ type: "signerAdded", key: opts.key, weight });
+    return this;
+  }
+
+  /**
+   * Removes a previously registered signer. Emits a `signerRemoved` event.
+   */
+  removeSigner(key: string): this {
+    if (this.signers.delete(key)) {
+      this._emit({ type: "signerRemoved", key });
+    }
+    return this;
+  }
+
+  /**
+   * Sets the account thresholds. Emits a `thresholdsSet` event.
+   */
+  setThresholds(opts: SetThresholdsOptions): this {
+    this.thresholds = {
+      masterWeight: opts.masterWeight ?? this.thresholds.masterWeight,
+      low: opts.low ?? this.thresholds.low,
+      medium: opts.medium ?? this.thresholds.medium,
+      high: opts.high ?? this.thresholds.high,
+    };
+    this._emit({ type: "thresholdsSet", thresholds: { ...this.thresholds } });
+    return this;
+  }
+
+  /**
+   * Returns the total signing weight of all registered signers.
+   */
+  getTotalWeight(): number {
+    let total = 0;
+    for (const weight of this.signers.values()) {
+      total += weight;
+    }
+    return total;
+  }
+
+  /**
+   * Returns true when the registered signers meet the high threshold.
+   */
+  isThresholdMet(): boolean {
+    return this.getTotalWeight() >= this.thresholds.high;
+  }
+
+  /**
+   * Subscribes to builder lifecycle events. Returns an unsubscribe function.
+   */
+  onEvent(listener: MultiSigEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private _emit(event: MultiSigEvent): void {
+    for (const listener of this.listeners) {
+      listener(event);
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // Build
   // --------------------------------------------------------------------------
 
@@ -166,6 +347,7 @@ export class OperationBuilder {
    * @throws {EnvelopeLimitError} when operation count > 100 or fee > 10_000_000 stroops.
    */
   build(): Transaction {
+    this.emit("build:start");
     this._validate();
 
     const sourceAccount = this._makeFakeAccount();
@@ -192,7 +374,9 @@ export class OperationBuilder {
       tb.setTimeout(30);
     }
 
-    return tb.build();
+    const tx = tb.build();
+    this.emit("build:complete", { transaction: tx });
+    return tx;
   }
 
   // --------------------------------------------------------------------------
@@ -208,12 +392,14 @@ export class OperationBuilder {
     const simResult = await this.server.simulateTransaction(tx);
 
     if (SorobanRpc.Api.isSimulationError(simResult)) {
-      return {
+      const result: DryRunResult = {
         success: false,
         cost: 0,
         events: [],
         simulatedXdr: tx.toXDR(),
       };
+      this.emit("dryrun:complete", { dryRunResult: result });
+      return result;
     }
 
     // assembleTransaction enriches the tx with resource limits / fees
@@ -229,12 +415,14 @@ export class OperationBuilder {
         ? ((simResult as { events: xdr.DiagnosticEvent[] }).events)
         : [];
 
-    return {
+    const result: DryRunResult = {
       success: true,
       cost,
       events,
       simulatedXdr: assembled.toXDR(),
     };
+    this.emit("dryrun:complete", { dryRunResult: result });
+    return result;
   }
 
   // --------------------------------------------------------------------------
@@ -278,34 +466,33 @@ export class OperationBuilder {
       }
     }
 
-    const sendResult = await this.server.sendTransaction(txToSubmit);
-
-    if (sendResult.status === "ERROR") {
-      const errDetail =
-        sendResult.errorResult
-          ? JSON.stringify(sendResult.errorResult)
-          : "Unknown error";
-      throw new DryRunFailedError(`Send failed: ${errDetail}`);
-    }
-
-    return { txHash: sendResult.hash };
+    const response = await this.server.sendTransaction(txToSubmit);
+    const result = { txHash: response.hash };
+    this.emit("submit:complete", { submitResult: result });
+    return result;
   }
 
   // --------------------------------------------------------------------------
-  // Private helpers
+  // Internals
   // --------------------------------------------------------------------------
 
+  /**
+   * Validates the staged envelope against protocol limits.
+   */
   private _validate(): void {
+    if (this.ops.length === 0) {
+      throw new EnvelopeLimitError(0, MAX_OPERATIONS);
+    }
     if (this.ops.length > MAX_OPERATIONS) {
       throw new EnvelopeLimitError(this.ops.length, MAX_OPERATIONS);
     }
   }
 
+  /**
+   * Builds a placeholder Account for TransactionBuilder (sequence is filled
+   * during simulation/submission by the RPC server).
+   */
   private _makeFakeAccount(): Account {
-    return {
-      accountId: () => this.config.sourceAddress,
-      sequenceNumber: () => "0",
-      incrementSequenceNumber: () => {},
-    } as unknown as Account;
+    return new Account(this.config.sourceAddress, "0");
   }
 }

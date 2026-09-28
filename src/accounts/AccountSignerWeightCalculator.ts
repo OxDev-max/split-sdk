@@ -31,6 +31,64 @@ export interface SignerWeightResult {
   missingWeight: number;
 }
 
+/**
+ * A single custody account signer entry, as returned by the custody account
+ * management helpers.
+ */
+export interface CustodySigner {
+  /** The signer's public key (G… address, pre-auth tx, or hash(x)). */
+  key: string;
+  /** The signing weight assigned to this signer. */
+  weight: number;
+}
+
+/**
+ * A snapshot of a custody account's signer configuration and thresholds.
+ */
+export interface CustodyAccount {
+  /** The Stellar account G… address. */
+  accountId: string;
+  /** The account's current signers. */
+  signers: CustodySigner[];
+  /** The account's threshold configuration. */
+  thresholds: {
+    low: number;
+    medium: number;
+    high: number;
+  };
+}
+
+/**
+ * Event names emitted by the custody account management helpers during
+ * lifecycle operations.
+ */
+export type CustodyAccountEvent =
+  | "signer:added"
+  | "signer:removed"
+  | "signer:updated"
+  | "threshold:updated"
+  | "account:loaded";
+
+/**
+ * Payload delivered to custody account event listeners.
+ */
+export interface CustodyAccountEventPayload {
+  /** The account the event pertains to. */
+  accountId: string;
+  /** The lifecycle event that occurred. */
+  event: CustodyAccountEvent;
+  /** The signer affected by the event, when applicable. */
+  signer?: CustodySigner;
+  /** The threshold level affected by the event, when applicable. */
+  thresholdLevel?: ThresholdLevel;
+  /** The previous value before the change, when applicable. */
+  previousValue?: number;
+  /** The new value after the change, when applicable. */
+  newValue?: number;
+}
+
+export type CustodyAccountEventListener = (payload: CustodyAccountEventPayload) => void;
+
 // ---------------------------------------------------------------------------
 // Cache entry
 // ---------------------------------------------------------------------------
@@ -49,6 +107,7 @@ export class AccountSignerWeightCalculator {
   /** Cache TTL in milliseconds (default 30 seconds). */
   private readonly cacheTtlMs: number;
   private readonly cache = new Map<string, CacheEntry>();
+  private readonly listeners = new Set<CustodyAccountEventListener>();
 
   constructor(horizonUrl: string, cacheTtlMs = 30_000) {
     this.server = new Horizon.Server(horizonUrl, { allowHttp: horizonUrl.startsWith("http://") });
@@ -125,8 +184,143 @@ export class AccountSignerWeightCalculator {
   }
 
   // --------------------------------------------------------------------------
+  // Custody account management helpers
+  // --------------------------------------------------------------------------
+
+  /**
+   * Load a custody account snapshot (signers + thresholds) from Horizon.
+   * Emits an `account:loaded` event on success.
+   */
+  async loadCustodyAccount(accountId: string): Promise<CustodyAccount> {
+    const record = await this._loadAccount(accountId);
+    const account = this._toCustodyAccount(accountId, record);
+    this._emit({ accountId, event: "account:loaded" });
+    return account;
+  }
+
+  /**
+   * Add a signer to a custody account snapshot. If the signer already exists
+   * its weight is updated instead. Emits `signer:added` or `signer:updated`.
+   */
+  addSigner(account: CustodyAccount, signer: CustodySigner): CustodyAccount {
+    const existing = account.signers.find((s) => s.key === signer.key);
+    let next: CustodyAccount;
+
+    if (existing) {
+      next = {
+        ...account,
+        signers: account.signers.map((s) => (s.key === signer.key ? { ...signer } : s)),
+      };
+      this._emit({
+        accountId: account.accountId,
+        event: "signer:updated",
+        signer: { ...signer },
+        previousValue: existing.weight,
+        newValue: signer.weight,
+      });
+    } else {
+      next = { ...account, signers: [...account.signers, { ...signer }] };
+      this._emit({
+        accountId: account.accountId,
+        event: "signer:added",
+        signer: { ...signer },
+        newValue: signer.weight,
+      });
+    }
+
+    return next;
+  }
+
+  /**
+   * Remove a signer from a custody account snapshot by public key.
+   * Emits `signer:removed` when a signer was actually removed.
+   */
+  removeSigner(account: CustodyAccount, signerKey: string): CustodyAccount {
+    const existing = account.signers.find((s) => s.key === signerKey);
+    if (!existing) {
+      return account;
+    }
+
+    const next: CustodyAccount = {
+      ...account,
+      signers: account.signers.filter((s) => s.key !== signerKey),
+    };
+
+    this._emit({
+      accountId: account.accountId,
+      event: "signer:removed",
+      signer: { ...existing },
+      previousValue: existing.weight,
+    });
+
+    return next;
+  }
+
+  /**
+   * Update a threshold level on a custody account snapshot.
+   * Emits `threshold:updated` when the value changes.
+   */
+  updateThreshold(
+    account: CustodyAccount,
+    level: ThresholdLevel,
+    value: number,
+  ): CustodyAccount {
+    const previousValue = account.thresholds[level];
+    if (previousValue === value) {
+      return account;
+    }
+
+    const next: CustodyAccount = {
+      ...account,
+      thresholds: { ...account.thresholds, [level]: value },
+    };
+
+    this._emit({
+      accountId: account.accountId,
+      event: "threshold:updated",
+      thresholdLevel: level,
+      previousValue,
+      newValue: value,
+    });
+
+    return next;
+  }
+
+  /**
+   * Register a listener for custody account lifecycle events.
+   * Returns an unsubscribe function.
+   */
+  onCustodyAccountEvent(listener: CustodyAccountEventListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  // --------------------------------------------------------------------------
   // Private helpers
   // --------------------------------------------------------------------------
+
+  private _emit(payload: CustodyAccountEventPayload): void {
+    for (const listener of this.listeners) {
+      listener(payload);
+    }
+  }
+
+  private _toCustodyAccount(
+    accountId: string,
+    record: Horizon.AccountResponse,
+  ): CustodyAccount {
+    return {
+      accountId,
+      signers: record.signers.map((s) => ({ key: s.key, weight: s.weight })),
+      thresholds: {
+        low: record.thresholds.low_threshold,
+        medium: record.thresholds.med_threshold,
+        high: record.thresholds.high_threshold,
+      },
+    };
+  }
 
   private async _loadAccount(accountId: string): Promise<Horizon.AccountResponse> {
     const now = Date.now();
@@ -181,6 +375,117 @@ export class AccountSignerWeightCalculator {
         return account.thresholds.med_threshold;
       case "high":
         return account.thresholds.high_threshold;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MultiSigTransactionBuilder
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds multi-signature transaction plans by collecting signers and a target
+ * threshold, then validating the collected weight against the account's
+ * on-chain thresholds via {@link AccountSignerWeightCalculator}.
+ *
+ * Emits lifecycle events so callers can react to signer/threshold changes and
+ * to the final build result.
+ *
+ * Issue #914
+ */
+export class MultiSigTransactionBuilder {
+  private readonly calculator: AccountSignerWeightCalculator;
+  private readonly accountId: string;
+  private readonly signers = new Map<string, MultiSigSigner>();
+  private readonly listeners = new Set<MultiSigBuilderListener>();
+  private threshold: ThresholdLevel = "medium";
+
+  constructor(accountId: string, calculator: AccountSignerWeightCalculator) {
+    this.accountId = accountId;
+    this.calculator = calculator;
+  }
+
+  /**
+   * Register a listener for builder lifecycle events.
+   *
+   * @returns An unsubscribe function that removes the listener.
+   */
+  on(listener: MultiSigBuilderListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /**
+   * Add a signer to the transaction. Re-adding an existing key updates its weight.
+   */
+  addSigner(key: string, weight: number): this {
+    const signer: MultiSigSigner = { key, weight };
+    this.signers.set(key, signer);
+    this._emit({ type: "signerAdded", signer });
+    return this;
+  }
+
+  /**
+   * Remove a signer by key. No-op if the key is not present.
+   */
+  removeSigner(key: string): this {
+    if (this.signers.delete(key)) {
+      this._emit({ type: "signerRemoved", key });
+    }
+    return this;
+  }
+
+  /**
+   * Set the threshold level the transaction must satisfy.
+   */
+  setThreshold(threshold: ThresholdLevel): this {
+    this.threshold = threshold;
+    this._emit({ type: "thresholdSet", threshold });
+    return this;
+  }
+
+  /**
+   * The signers currently configured on the builder.
+   */
+  getSigners(): MultiSigSigner[] {
+    return Array.from(this.signers.values());
+  }
+
+  /**
+   * Build the multi-signature transaction plan, validating the configured
+   * signers against the account's on-chain thresholds.
+   *
+   * @throws {InsufficientSignerWeightError} when the configured signers do not
+   *   meet the required threshold.
+   */
+  async build(): Promise<MultiSigTransaction> {
+    const signers = this.getSigners();
+    const keys = signers.map((s) => s.key);
+
+    const result = await this.calculator.calculateWeight(this.accountId, keys, this.threshold);
+
+    if (!result.sufficient) {
+      throw new InsufficientSignerWeightError(keys, result.totalWeight, result.requiredThreshold);
+    }
+
+    const transaction: MultiSigTransaction = {
+      accountId: this.accountId,
+      threshold: this.threshold,
+      signers,
+      totalWeight: result.totalWeight,
+      requiredThreshold: result.requiredThreshold,
+      sufficient: result.sufficient,
+    };
+
+    this._emit({ type: "built", transaction });
+    return transaction;
+  }
+
+  private _emit(event: MultiSigBuilderEvent): void {
+    for (const listener of this.listeners) {
+      listener(event);
     }
   }
 }

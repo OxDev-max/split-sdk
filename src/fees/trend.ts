@@ -103,3 +103,49 @@ export class FeeTrendAnalyzer {
     this.buffer.evictOldestWhile((sample) => sample.capturedAt < cutoff);
   }
 }
+
+// ---------------------------------------------------------------------------
+// computeMovingAverage (#781)
+// ---------------------------------------------------------------------------
+
+/**
+ * Computes a Simple Moving Average (SMA) series over `samples`.
+ *
+ * The returned array has the same length as `samples`.  The first
+ * `windowSize - 1` entries are padded with `NaN` because there are not yet
+ * enough data points to fill a complete window.
+ *
+ * The function is pure — it neither reads nor mutates any external state.
+ *
+ * @param samples    - Input data series (e.g. fee samples in stroops).
+ * @param windowSize - Number of consecutive samples per average window.
+ *                     Must be an integer ≥ 1; throws `RangeError` otherwise.
+ * @returns          - SMA series of the same length as `samples`.
+ *
+ * @example
+ * ```ts
+ * computeMovingAverage([100, 200, 300, 400, 500], 3);
+ * // => [NaN, NaN, 200, 300, 400]
+ * ```
+ *
+ * @throws {RangeError} when `windowSize` is less than 1.
+ */
+export function computeMovingAverage(
+  samples: number[],
+  windowSize: number,
+): number[] {
+  if (!Number.isInteger(windowSize) || windowSize < 1) {
+    throw new RangeError(
+      `windowSize must be an integer ≥ 1, got ${windowSize}`,
+    );
+  }
+
+  return samples.map((_, i) => {
+    if (i < windowSize - 1) return NaN;
+    let sum = 0;
+    for (let j = i - windowSize + 1; j <= i; j++) {
+      sum += samples[j]!;
+    }
+    return sum / windowSize;
+  });
+}

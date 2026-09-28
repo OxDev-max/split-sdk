@@ -38,55 +38,36 @@ export type ChannelStateFetcher = (
   payer: string
 ) => Promise<ChannelState>;
 
-/** A single local channel_pay entry used as matching input. */
-export interface LocalPayment {
-  /** Amount paid (stroops). */
-  amount: bigint;
-  /** Optional payer address the payment was attributed to. */
-  payer?: string;
-  /** Optional invoice the payment was attributed to. */
-  invoiceId?: string;
+/** Lifecycle events emitted during invoice reconciliation. */
+export type ReconciliationEvent =
+  | { type: "reconciliation:started"; invoiceId: string; payer: string }
+  | { type: "reconciliation:matched"; invoiceId: string; payer: string; result: ChannelReconciliationResult }
+  | { type: "reconciliation:discrepancy"; invoiceId: string; payer: string; result: ChannelReconciliationResult }
+  | { type: "reconciliation:completed"; invoiceId: string; payer: string; result: ChannelReconciliationResult }
+  | { type: "reconciliation:error"; invoiceId: string; payer: string; error: unknown };
+
+/** Listener invoked for every reconciliation lifecycle event. */
+export type ReconciliationEventListener = (event: ReconciliationEvent) => void;
+
+const _listeners = new Set<ReconciliationEventListener>();
+
+/**
+ * Subscribe to reconciliation lifecycle events.
+ *
+ * @returns An unsubscribe function that removes the listener.
+ */
+export function onReconciliationEvent(listener: ReconciliationEventListener): () => void {
+  _listeners.add(listener);
+  return () => {
+    _listeners.delete(listener);
+  };
 }
 
-/** A single on-chain channel_pay entry used as matching input. */
-export interface OnChainPayment {
-  /** Amount paid (stroops). */
-  amount: bigint;
-  /** Optional payer address the payment was attributed to. */
-  payer?: string;
-  /** Optional invoice the payment was attributed to. */
-  invoiceId?: string;
+function emit(event: ReconciliationEvent): void {
+  for (const listener of _listeners) {
+    listener(event);
+  }
 }
-
-/** A matched pair of local and on-chain payments. */
-export interface InvoiceMatch {
-  /** The local payment that was matched. */
-  local: LocalPayment;
-  /** The on-chain payment it was matched against. */
-  onChain: OnChainPayment;
-}
-
-/** Result of matching local payments against on-chain payments. */
-export interface InvoiceMatchingResult {
-  /** Pairs of local/on-chain payments that matched. */
-  matches: InvoiceMatch[];
-  /** Local payments with no on-chain counterpart. */
-  unmatchedLocal: LocalPayment[];
-  /** On-chain payments with no local counterpart. */
-  unmatchedOnChain: OnChainPayment[];
-  /** True when every local payment matched and no on-chain payment is left over. */
-  balanced: boolean;
-}
-
-/** Events emitted by the invoice matching engine. */
-export type InvoiceMatchingEvent =
-  | { type: "match"; match: InvoiceMatch }
-  | { type: "unmatchedLocal"; payment: LocalPayment }
-  | { type: "unmatchedOnChain"; payment: OnChainPayment }
-  | { type: "complete"; result: InvoiceMatchingResult };
-
-/** Listener invoked for every invoice matching event. */
-export type InvoiceMatchingListener = (event: InvoiceMatchingEvent) => void;
 
 let _fetcher: ChannelStateFetcher | null = null;
 
@@ -114,89 +95,39 @@ export async function reconcileChannel(
   localPayments: bigint[],
   fetcher?: ChannelStateFetcher
 ): Promise<ChannelReconciliationResult> {
-  const resolveFetcher = fetcher ?? _fetcher;
-  if (!resolveFetcher) {
-    throw new ChannelReconciliationError(
-      "No channel state fetcher registered. Call registerChannelStateFetcher() first."
-    );
-  }
+  emit({ type: "reconciliation:started", invoiceId, payer });
 
-  const { deposited, balance: onChainBalance } = await resolveFetcher(invoiceId, payer);
-
-  const totalPaid = localPayments.reduce((sum, amt) => sum + amt, 0n);
-  const expectedBalance = deposited - totalPaid;
-  const delta = onChainBalance - expectedBalance;
-
-  return {
-    inSync: delta === 0n,
-    onChainBalance,
-    expectedBalance,
-    delta,
-  };
-}
-
-/**
- * Match local channel_pay entries against on-chain channel_pay entries.
- *
- * Matching is greedy and amount-based: each local payment is paired with the
- * first still-unmatched on-chain payment of the same amount. When both sides
- * carry a payer and/or invoiceId, those must agree as well. Leftovers on either
- * side are reported as unmatched.
- *
- * @param localPayments   - Local channel_pay entries to match.
- * @param onChainPayments - On-chain channel_pay entries to match against.
- * @param listener        - Optional listener receiving match/unmatch/complete events.
- *
- * @returns Matching result — no on-chain writes are performed.
- */
-export function matchInvoices(
-  localPayments: LocalPayment[],
-  onChainPayments: OnChainPayment[],
-  listener?: InvoiceMatchingListener
-): InvoiceMatchingResult {
-  const remaining = onChainPayments.slice();
-  const matches: InvoiceMatch[] = [];
-  const unmatchedLocal: LocalPayment[] = [];
-
-  for (const local of localPayments) {
-    const index = remaining.findIndex((onChain) => {
-      if (onChain.amount !== local.amount) return false;
-      if (local.payer !== undefined && onChain.payer !== undefined && onChain.payer !== local.payer) {
-        return false;
-      }
-      if (
-        local.invoiceId !== undefined &&
-        onChain.invoiceId !== undefined &&
-        onChain.invoiceId !== local.invoiceId
-      ) {
-        return false;
-      }
-      return true;
-    });
-
-    if (index === -1) {
-      unmatchedLocal.push(local);
-      listener?.({ type: "unmatchedLocal", payment: local });
-      continue;
+  try {
+    const resolveFetcher = fetcher ?? _fetcher;
+    if (!resolveFetcher) {
+      throw new ChannelReconciliationError(
+        "No channel state fetcher registered. Call registerChannelStateFetcher() first."
+      );
     }
 
-    const [onChain] = remaining.splice(index, 1);
-    const match: InvoiceMatch = { local, onChain };
-    matches.push(match);
-    listener?.({ type: "match", match });
+    const { deposited, balance: onChainBalance } = await resolveFetcher(invoiceId, payer);
+
+    const totalPaid = localPayments.reduce((sum, amt) => sum + amt, 0n);
+    const expectedBalance = deposited - totalPaid;
+    const delta = onChainBalance - expectedBalance;
+
+    const result: ChannelReconciliationResult = {
+      inSync: delta === 0n,
+      onChainBalance,
+      expectedBalance,
+      delta,
+    };
+
+    if (result.inSync) {
+      emit({ type: "reconciliation:matched", invoiceId, payer, result });
+    } else {
+      emit({ type: "reconciliation:discrepancy", invoiceId, payer, result });
+    }
+
+    emit({ type: "reconciliation:completed", invoiceId, payer, result });
+    return result;
+  } catch (error) {
+    emit({ type: "reconciliation:error", invoiceId, payer, error });
+    throw error;
   }
-
-  for (const onChain of remaining) {
-    listener?.({ type: "unmatchedOnChain", payment: onChain });
-  }
-
-  const result: InvoiceMatchingResult = {
-    matches,
-    unmatchedLocal,
-    unmatchedOnChain: remaining,
-    balanced: unmatchedLocal.length === 0 && remaining.length === 0,
-  };
-
-  listener?.({ type: "complete", result });
-  return result;
 }
