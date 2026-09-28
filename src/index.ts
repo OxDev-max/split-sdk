@@ -16,6 +16,15 @@ export type {
   StellarSplitPlugin,
 } from "./client.js";
 
+export {
+  NetworkEnvironment,
+  NETWORK_PRESETS,
+  isNetworkPreset,
+  getNetworkPreset,
+  detectNetworkEnvironment,
+} from "./config.js";
+export type { NetworkPreset } from "./config.js";
+
 export type {
   TelemetryHooks,
   TelemetryErrorContext,
@@ -23,8 +32,8 @@ export type {
   TelemetryCallEndParams,
 } from "./telemetryHooks.js";
 
-export { PluginRegistry, LoggingPlugin } from "./plugin.js";
-export type { SdkPlugin, SdkMethodName, PluginArgs, PluginResult } from "./plugin.js";
+export { PluginRegistry, LoggingPlugin, MetricsPlugin } from "./plugin.js";
+export type { SdkPlugin, SdkMethodName, PluginArgs, PluginResult, StellarSplitClientContext } from "./plugin.js";
 
 export {
   serializeInvoiceTemplate,
@@ -105,6 +114,10 @@ export {
   PathRouterError,
   OfferTrackingError,
   ClaimableBalanceLifecycleError,
+  InvoiceFullyFundedError,
+  isInvoiceFullyFundedError,
+  DelegateLimitReachedError,
+  isDelegateLimitReachedError,
   isInvoiceNotFoundError,
   isInvoiceNotPendingError,
   isDeadlinePassedError,
@@ -174,6 +187,8 @@ export {
   isRequestTimeoutError,
   AdminOperationError,
   isAdminOperationError,
+  NetworkMismatchError,
+  isNetworkMismatchError,
   CommitmentGenerationError,
   isCommitmentGenerationError,
   BlindingFactorStorageError,
@@ -216,6 +231,9 @@ export {
   // Keypair format and signing validation (issue #768)
   InvalidKeypairError,
   isInvalidKeypairError,
+  // Batch operations errors (issue #855)
+  BatchTooLargeError,
+  isBatchTooLargeError,
 } from "./errors.js";
 
 // Invoice metadata JSON Schema validator (issue #533)
@@ -850,6 +868,15 @@ export { trackVelocity } from "./velocityTracker.js";
 export type { VelocityReport, InvoiceVelocity, PaymentTrend } from "./velocityTracker.js";
 export type { VelocityStatus, VelocityWindowStatus } from "./types.js";
 
+// Issue #866 — Pause/Resume invoice
+export type { PauseStatus } from "./types.js";
+
+// Issue #867 — Pledge matching
+export type { MatchPledge } from "./types.js";
+
+// Issue #868 — Streaming payments
+export type { Stream } from "./types.js";
+
 // Tranche release progress tracking
 export { getTrancheProgress } from "./trancheProgress.js";
 export type {
@@ -1228,6 +1255,31 @@ export type { Unsubscribe, EventMap } from "./events/TypedEventEmitter.js";
 export type { SplitClientEventMap } from "./client.js";
 
 // ---------------------------------------------------------------------------
+// SDK event bus — typed contract events (issue #856)
+// ---------------------------------------------------------------------------
+
+export type {
+  PaymentEvent,
+  ReleaseEvent,
+  RefundEvent,
+  DisputeEvent,
+  TierUnlockedEvent,
+  EventFilterOptions,
+  ContractEvent,
+} from "./contractEvents.js";
+
+// ---------------------------------------------------------------------------
+// Creator statistics (issue #854)
+// ---------------------------------------------------------------------------
+
+export type { CreatorStats } from "./creatorStats.js";
+export {
+  getCreatorStatsCache,
+  setCreatorStatsCache,
+  clearCreatorStatsCache,
+} from "./creatorStats.js";
+
+// ---------------------------------------------------------------------------
 // Multi-endpoint RPC load balancing
 // ---------------------------------------------------------------------------
 
@@ -1428,30 +1480,49 @@ export type {
   SubmitServer,
 } from "./transaction/submit.js";
 
-// ---------------------------------------------------------------------------
-// #840 — XBullAdapter listener-leak fix
-// ---------------------------------------------------------------------------
+// Request queue with priority lanes
+export { RequestQueue } from "./requestQueue.js";
+export type { PriorityLane, QueuedRequest, QueueStats } from "./requestQueue.js";
 
-export { XBullAdapter } from "./wallets/adapters/XBullAdapter.js";
+// Invoice history retrieval and parsing
+export { getInvoiceHistory, getHistoryPage, parseHistoryEvent } from "./invoiceHistory.js";
+export type {
+  HistoryEntry,
+  HistoryEventType,
+  HistoryPage,
+  HistoryPageOptions,
+  PaymentHistoryEntry,
+  ReleaseHistoryEntry,
+  RefundHistoryEntry,
+  NoteHistoryEntry,
+  PauseHistoryEntry,
+  ResumeHistoryEntry,
+  CancelHistoryEntry,
+  FreezeHistoryEntry,
+  UnfreezeHistoryEntry,
+} from "./types/invoiceHistory.js";
 
-// ---------------------------------------------------------------------------
-// #781 — Moving average for fee trend analysis
-// ---------------------------------------------------------------------------
+// Template management
+export {
+  saveTemplate,
+  createFromTemplate,
+  deleteTemplate,
+  getTemplate,
+  listTemplates,
+  TemplateNotFoundError,
+  TemplateAccessDeniedError,
+} from "./templates.js";
+export type { InvoiceTemplate, CreateFromTemplateParams, SaveTemplateParams } from "./types/templates.js";
 
-export { computeMovingAverage } from "./fees/trend.js";
-
-// ---------------------------------------------------------------------------
-// #780 — Certificate pinning for anchor HTTPS endpoints
-// ---------------------------------------------------------------------------
-
-export { AnchorVerifier } from "./anchors/AnchorVerifier.js";
-export type { AnchorVerifierOptions, VerificationResult } from "./anchors/AnchorVerifier.js";
-export { CertificatePinningError } from "./errors.js";
-
-// ---------------------------------------------------------------------------
-// #779 — TOML schema version validation
-// ---------------------------------------------------------------------------
-
-export { StellarTomlParser, SUPPORTED_TOML_VERSIONS } from "./anchors/StellarTomlParser.js";
-export type { StellarTomlParserOptions, TomlMetadata, TomlCurrency } from "./anchors/StellarTomlParser.js";
-export { UnsupportedTomlVersionError } from "./errors.js";
+// Recurring subscriptions
+export {
+  createSubscription,
+  triggerSubscription,
+  pauseSubscription,
+  resumeSubscription,
+  getSubscription,
+  cancelSubscription,
+  SubscriptionNotFoundError,
+  TooEarlyToTriggerError,
+} from "./subscriptions.js";
+export type { Subscription, SubscriptionStatus, CreateSubscriptionParams } from "./types/subscriptions.js";

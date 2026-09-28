@@ -1578,6 +1578,38 @@ export class PassphraseMismatchError extends StellarSplitError {
   }
 }
 
+/**
+ * Thrown when the passphrase of the requested network preset does not match the
+ * passphrase reported by the live Soroban RPC endpoint, so the switch is
+ * rejected and the client stays on its current network.
+ *
+ * Carries both sides of the comparison so callers can surface them without
+ * parsing the message: `expected` is the preset passphrase and `actual` is what
+ * the RPC node reported.
+ */
+export class NetworkMismatchError extends StellarSplitError {
+  /** The passphrase configured by the requested network preset. */
+  readonly expected: string;
+  /** The passphrase reported by the live RPC endpoint. */
+  readonly actual: string;
+
+  constructor(expected: string, actual: string) {
+    super(
+      `Network passphrase mismatch: expected [${expected}] but the RPC node reported [${actual}].`,
+      "NETWORK_MISMATCH",
+      { expected, actual }
+    );
+    this.name = "NetworkMismatchError";
+    this.expected = expected;
+    this.actual = actual;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isNetworkMismatchError(err: unknown): err is NetworkMismatchError {
+  return err instanceof NetworkMismatchError;
+}
+
 // ---------------------------------------------------------------------------
 // Sequence cache errors
 // ---------------------------------------------------------------------------
@@ -2296,5 +2328,31 @@ export class WalletConnectionTimeoutError extends StellarSplitError {
 
 export function isWalletConnectionTimeoutError(err: unknown): err is WalletConnectionTimeoutError {
   return err instanceof WalletConnectionTimeoutError;
+}
+
+// ---------------------------------------------------------------------------
+// Batch operations errors
+// ---------------------------------------------------------------------------
+
+/** Thrown when a batch operation exceeds the maximum allowed size. */
+export class BatchTooLargeError extends StellarSplitError {
+  readonly batchSize: number;
+  readonly maxSize: number;
+
+  constructor(batchSize: number, maxSize: number = 20) {
+    super(
+      `Batch size ${batchSize} exceeds maximum of ${maxSize}`,
+      "BATCH_TOO_LARGE",
+      { batchSize, maxSize },
+    );
+    this.name = "BatchTooLargeError";
+    this.batchSize = batchSize;
+    this.maxSize = maxSize;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
+  return err instanceof BatchTooLargeError;
 }
 
